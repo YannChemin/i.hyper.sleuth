@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>i.hyper.sleuth - GRASS GIS manual</title>
+<meta charset="utf-8">
+</head>
+<body>
+
+<h2>DESCRIPTION</h2>
+
+<p><em>i.hyper.sleuth</em> finds the pixels in a hyperspectral 3D raster that
+most closely match a user-supplied reference spectrum.  For each pixel the
+module computes a similarity score in [0,&nbsp;1] (0&nbsp;=&nbsp;no match,
+1&nbsp;=&nbsp;perfect match) using one or more of <b>18 spectral-similarity
+methods</b> drawn from remote sensing, signal analysis, information theory,
+morphological mathematics, and subpixel-detection theory.</p>
+
+<p>The reference spectrum is automatically resampled onto the sensor wavelength
+grid via a precomputed <b>WavelengthLUT</b> (linear interpolation;
+O(<em>n</em>) per pixel, no repeated binary search).  Optional preprocessing
+— continuum removal, normalization, probability-simplex projection — is
+applied identically to the reference and to every pixel before matching.</p>
+
+<p>The module also exposes a full <b>multi-method consensus pipeline</b>
+(<tt>method=consensus</tt>) that runs all 16 base methods simultaneously,
+calibrates each score map to a true per-pixel probability via an empirical
+CDF rank transform, down-weights correlated methods using an inter-method
+diversity analysis, and fuses the result into a single hotspot probability
+map plus four diagnostic maps (agreement, entropy, conflict, spread).</p>
+
+<p><em>i.hyper.sleuth</em> is part of the <b>i.hyper</b> module family for
+hyperspectral data import, atmospheric correction, and analysis in GRASS GIS.
+Input 3D rasters are produced by <a href="i.hyper.import.html">i.hyper.import</a>
+or <a href="i.hyper.atcorr.html">i.hyper.atcorr</a>.</p>
+
+<h3>Reference spectrum formats</h3>
+
+<h4>Inline (<tt>reference=</tt>)</h4>
+<p>Comma-separated <tt>wavelength:reflectance</tt> pairs:</p>
+<div class="code"><pre>
+reference="450:0.04,550:0.11,670:0.05,750:0.40,900:0.45,1650:0.22,2200:0.18"
+</pre></div>
+<p>Semicolons are also accepted as the pair separator.</p>
+
+<h4>CSV file (<tt>reference_file=</tt>)</h4>
+<p>Two columns <tt>wavelength,reflectance</tt>, one pair per line.
+An optional header row (non-numeric first field) is skipped automatically.
+Wavelength units must match the sensor metadata (nanometres by default).</p>
+
+<h4>JSON file (<tt>reference_file=</tt>)</h4>
+<p>Any of the following layouts are accepted:</p>
+<ul>
+  <li><tt>[[wl, r], [wl, r], ...]</tt></li>
+  <li><tt>{"wavelengths": [...], "reflectances": [...]}</tt></li>
+  <li><tt>{"data": [[wl, r], ...]}</tt></li>
+</ul>
+
+<h3>Similarity methods</h3>
+
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Key</th><th>Name</th><th>Category</th><th>Description</th></tr>
+
+<tr><td><b>sam</b></td><td>Spectral Angle Mapper</td><td>Geometric</td>
+  <td>Angle θ between reference vector and pixel vector in <em>n</em>-dimensional
+  reflectance space.  Scale-invariant (insensitive to illumination magnitude).
+  sim&nbsp;=&nbsp;1&nbsp;&minus;&nbsp;2θ/π.</td></tr>
+
+<tr><td><b>sid</b></td><td>Spectral Information Divergence</td><td>Information theory</td>
+  <td>Symmetric KL divergence between spectra treated as probability
+  distributions.  SID&nbsp;=&nbsp;D(r‖p)&nbsp;+&nbsp;D(p‖r);
+  sim&nbsp;=&nbsp;exp(&minus;SID).  Sensitive to subtle energy redistribution
+  between bands.</td></tr>
+
+<tr><td><b>sid_sam</b></td><td>SID × tan(SAM)</td><td>Information theory / Geometric</td>
+  <td>Hybrid measure (Chang 2000): sim&nbsp;=&nbsp;exp(&minus;SID·tan&nbsp;θ<sub>SAM</sub>).
+  Combines probabilistic and angular perspectives; effective when both shape
+  and energy differ between target and background.</td></tr>
+
+<tr><td><b>ed</b></td><td>Euclidean Distance (L2)</td><td>Distance</td>
+  <td>Root-mean-square per-band difference.
+  sim&nbsp;=&nbsp;1/(1&nbsp;+&nbsp;‖r&minus;p‖₂/√n).
+  Use with <tt>normalize=vector</tt> to remove illumination effects.</td></tr>
+
+<tr><td><b>sad</b></td><td>Spectral Absolute Difference (L1)</td><td>Distance</td>
+  <td>Mean absolute per-band difference; more robust to outlier bands than L2.
+  sim&nbsp;=&nbsp;1/(1&nbsp;+&nbsp;mean|r<sub>i</sub>&minus;p<sub>i</sub>|).</td></tr>
+
+<tr><td><b>sca</b></td><td>Spectral Correlation Angle (Pearson <em>r</em>)</td><td>Statistical</td>
+  <td>Pearson correlation between reference and pixel spectra mapped to [0,&nbsp;1].
+  Captures spectral shape independently of mean level; equivalent to SAM
+  applied to mean-centered spectra.</td></tr>
+
+<tr><td><b>cr_sam</b></td><td>Continuum-Removed SAM</td><td>Morphological / Geometric</td>
+  <td>Upper-convex-hull continuum removal (Clark et al. 1987) applied to both
+  spectra before SAM.  Isolates absorption-feature shape, removing broadband
+  albedo and slope.  Best for mineral identification.</td></tr>
+
+<tr><td><b>cr_ed</b></td><td>Continuum-Removed Euclidean Distance</td><td>Morphological / Distance</td>
+  <td>Same continuum removal as <b>cr_sam</b>, followed by L2 distance.
+  Useful when absolute band-depth differences are meaningful in addition to
+  angular deviation.</td></tr>
+
+<tr><td><b>gd1</b></td><td>1st-Derivative Shape Matching</td><td>Signal analysis</td>
+  <td>Finite-difference first derivative of both spectra, then SAM.  Highly
+  sensitive to slope transitions and absorption-edge positions; insensitive to
+  overall level and broadband curvature — analogous to high-pass filtering.</td></tr>
+
+<tr><td><b>gd2</b></td><td>2nd-Derivative Shape Matching</td><td>Signal analysis</td>
+  <td>Second finite difference, then SAM.  Responds only to local curvature —
+  absorption-band centres and inflection points.  Requires well-calibrated
+  data with low noise.</td></tr>
+
+<tr><td><b>xcorr</b></td><td>Normalized Cross-Correlation</td><td>Signal analysis</td>
+  <td>NCC computed at lags [&minus;W,&nbsp;+W] (controlled by
+  <tt>shift_window=</tt>); maximum over all lags returned.  Tolerates small
+  wavelength-calibration offsets.
+  sim&nbsp;=&nbsp;(max<sub>k</sub>NCC&nbsp;+&nbsp;1)/2.</td></tr>
+
+<tr><td><b>dtw</b></td><td>Dynamic Time Warping</td><td>Signal analysis</td>
+  <td>Sakoe-Chiba band DTW in a rolling two-row window (memory-efficient).
+  Finds minimum-cost alignment under a bandwidth constraint of
+  <tt>shift_window=</tt> bands.  Captures non-linear feature stretching.
+  sim&nbsp;=&nbsp;exp(&minus;DTW<sub>norm</sub>).</td></tr>
+
+<tr><td><b>ssim</b></td><td>Spectral Structural Similarity Index</td><td>Signal analysis</td>
+  <td>Wang et al. (2004) adapted to 1-D spectra.  Decomposes similarity into
+  luminance (mean), contrast (std dev), and structure (covariance) components.
+  sim&nbsp;=&nbsp;(SSIM&nbsp;+&nbsp;1)/2.</td></tr>
+
+<tr><td><b>jsd</b></td><td>Jensen-Shannon Divergence</td><td>Information theory</td>
+  <td>JSD&nbsp;=&nbsp;(KLD(r‖m)&nbsp;+&nbsp;KLD(p‖m))/2 where m&nbsp;=&nbsp;(r+p)/2.
+  Always well-defined; bounded in [0,&nbsp;ln&nbsp;2].
+  sim&nbsp;=&nbsp;exp(&minus;JSD).  Recommended with <tt>-z</tt>.</td></tr>
+
+<tr><td><b>bhatt</b></td><td>Bhattacharyya Coefficient</td><td>Statistical</td>
+  <td>BC&nbsp;=&nbsp;Σ√(p<sub>i</sub>q<sub>i</sub>) ∈ [0,&nbsp;1].  Directly
+  a similarity; no further transform needed.  Robust to band noise.
+  Recommended with <tt>-z</tt>.</td></tr>
+
+<tr><td><b>mtf</b></td><td>Matched Tuned Filter</td><td>Subpixel detection</td>
+  <td>Reed-Yu (1990) linear detector:
+  w&nbsp;=&nbsp;Σ<sup>&minus;1</sup>(d&minus;μ)/(d&minus;μ)<sup>T</sup>Σ<sup>&minus;1</sup>(d&minus;μ).
+  Maximises signal-to-background ratio for target <b>d</b>.  Requires full
+  cube to compute image covariance Σ.  Score percentile-normalised to
+  [0,&nbsp;1].</td></tr>
+
+<tr><td><b>cem</b></td><td>Constrained Energy Minimization</td><td>Subpixel detection</td>
+  <td>Chang &amp; Heinz (2000):
+  w&nbsp;=&nbsp;Σ<sup>&minus;1</sup>d/(d<sup>T</sup>Σ<sup>&minus;1</sup>d).
+  Minimises mean output energy subject to unit target response.  No explicit
+  background model; effective for small-fraction targets.  Score
+  percentile-normalised to [0,&nbsp;1].</td></tr>
+
+<tr><td><b>ensemble</b></td><td>Rank-based Ensemble Fusion</td><td>Meta-method</td>
+  <td>Borda-count rank aggregation: pixel ranks within each method are summed
+  and normalised to [0,&nbsp;1].  Robust to scale differences between methods;
+  reduces sensitivity to any single method's failure mode.</td></tr>
+
+<tr><td><b>consensus</b></td><td>Calibrated Probability Fusion</td><td>Meta-method</td>
+  <td>Four-step pipeline: (1)&nbsp;run all 16 base methods; (2)&nbsp;CDF
+  rank-calibrate each map to a true probability; (3)&nbsp;compute
+  inter-method diversity weights; (4)&nbsp;fuse via the selected
+  <tt>fusion_mode</tt>.  Produces a hotspot probability map plus four
+  diagnostic maps.  See the <a href="#consensus">Consensus analysis</a>
+  section.</td></tr>
+</table>
+
+<h3 id="consensus">Consensus analysis (<tt>method=consensus</tt>)</h3>
+
+<p>When <tt>consensus</tt> is requested the module executes a four-step
+pipeline:</p>
+
+<ol>
+<li><b>Compute all base methods.</b>  All 16 methods (excluding
+  <tt>ensemble</tt>/<tt>consensus</tt>) are run against the cube.
+  Already-computed maps identified via <tt>output_prefix=</tt> are
+  reused.</li>
+
+<li><b>Empirical CDF calibration.</b>  Each score map is rank-transformed to
+  a uniform probability in (0,&nbsp;1]:
+  <pre>p_m(i) = rank(score_m(i)) / N_pixels</pre>
+  This removes scale bias that would otherwise allow high-range methods (SAM
+  ∈&nbsp;[0.8,&nbsp;1.0]) to dominate over low-range methods (ED
+  ∈&nbsp;[0.0,&nbsp;0.2]).  Calibrated maps are written as
+  <tt>{prefix}_cal_{method}</tt>.</li>
+
+<li><b>Diversity weighting.</b>  The full <em>k</em>&nbsp;×&nbsp;<em>k</em>
+  Pearson correlation matrix is built across calibrated maps.  Each method
+  receives weight:
+  <pre>w_i ∝ 1 / (mean_{j≠i} |r_{ij}| + 0.15)</pre>
+  so that correlated clusters (e.g., SAM&nbsp;+&nbsp;SCA) do not over-count
+  their shared evidence.  Weights are rescaled so that mean(w)&nbsp;=&nbsp;1.
+  Print with <tt>-v</tt>.</li>
+
+<li><b>Fusion.</b>  Six modes via <tt>fusion_mode=</tt>:
+
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Mode</th><th>Formula</th><th>Characteristics</th></tr>
+<tr><td><tt>rank_product</tt></td>
+    <td>exp(Σᵢ wᵢ ln pᵢ)</td>
+    <td>Weighted geometric mean; AND-like; robust <em>(default)</em></td></tr>
+<tr><td><tt>fisher</tt></td>
+    <td>1 − χ²_sf(−2 Σᵢ wᵢ ln(1−pᵢ), df_eff)</td>
+    <td>Proper p-value from combined probability test (Fisher 1932)</td></tr>
+<tr><td><tt>stouffer</tt></td>
+    <td>Φ(Σᵢ wᵢ Φ⁻¹(pᵢ) / √Σᵢ wᵢ²)</td>
+    <td>Diversity weights enter exactly via Z-score combination (Stouffer 1949)</td></tr>
+<tr><td><tt>group_product</tt></td>
+    <td>geometric mean within groups; arithmetic mean across</td>
+    <td>AND within geometric/distance/info groups; OR across groups</td></tr>
+<tr><td><tt>harmonic</tt></td>
+    <td>1 / Σᵢ wᵢ/pᵢ</td>
+    <td>Strictest: all methods must simultaneously agree</td></tr>
+<tr><td><tt>min</tt></td>
+    <td>min<sub>i</sub> pᵢ</td>
+    <td>Absolute strictest; dominated by the single worst method</td></tr>
+</table>
+</li>
+</ol>
+
+<h4>Consensus output maps</h4>
+<p>When <tt>output_prefix=</tt> is set, the following maps are written in
+addition to the primary <tt>output=</tt> hotspot probability map:</p>
+
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Map</th><th>Content</th></tr>
+<tr><td><tt>{prefix}_consensus_agreement</tt></td>
+    <td>Fraction of methods voting above <tt>agreement_threshold</tt> [0, 1]</td></tr>
+<tr><td><tt>{prefix}_consensus_entropy</tt></td>
+    <td>Normalised Shannon entropy of calibrated scores: 0&nbsp;=&nbsp;unanimous, 1&nbsp;=&nbsp;maximal conflict</td></tr>
+<tr><td><tt>{prefix}_consensus_conflict</tt></td>
+    <td>Pixels that are simultaneously high-probability AND high-entropy — review these</td></tr>
+<tr><td><tt>{prefix}_consensus_spread</tt></td>
+    <td>Standard deviation of calibrated scores per pixel</td></tr>
+<tr><td><tt>{prefix}_cal_{method}</tt></td>
+    <td>Rank-calibrated probability for each of the 16 base methods</td></tr>
+<tr><td><tt>{prefix}_{method}</tt></td>
+    <td>Raw similarity score for each base method</td></tr>
+</table>
+
+<h3>WavelengthLUT</h3>
+
+<p>The reference spectrum and the sensor wavelength grid will almost always
+differ in sampling and range.  A <tt>WavelengthLUT</tt> is built once before
+any pixel processing:</p>
+<ul>
+  <li><tt>np.searchsorted</tt> indices <em>left_idx</em>, <em>right_idx</em>
+    and linear blend weights <em>alpha</em> are precomputed for every
+    destination band.</li>
+  <li><tt>apply(src_vals)</tt> is O(<em>n</em><sub>bands</sub>) with no
+    binary search: a single gather-and-blend over the two precomputed index
+    arrays.</li>
+  <li>Sensor bands outside the reference range are edge-filled and flagged;
+    reference features outside the sensor range trigger a warning about
+    unobservable spectral regions.</li>
+</ul>
+<p>Use <tt>-i</tt> (info mode) to inspect the coverage report before
+processing.</p>
+
+<h3>Preprocessing flags</h3>
+
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Flag</th><th>Effect</th><th>Recommended with</th></tr>
+<tr><td><b>-c</b></td>
+  <td>Apply upper-convex-hull continuum removal to every pixel and to the
+  reference before matching.  Removes broadband albedo variation, leaving
+  only absorption feature shape.</td>
+  <td>sam, ed, sca — removes illumination / slope bias</td></tr>
+<tr><td><b>-z</b></td>
+  <td>Normalise both reference and pixel spectra to the probability simplex
+  (sum-to-one, all values ≥ 0) before matching.</td>
+  <td>sid, jsd, bhatt — these methods assume probability distributions</td></tr>
+</table>
+
+<h3>Normalization options (<tt>normalize=</tt>)</h3>
+
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Option</th><th>Transform</th></tr>
+<tr><td><tt>none</tt></td><td>Raw reflectance (default)</td></tr>
+<tr><td><tt>area</tt></td><td>Divide by spectral sum; total power = 1</td></tr>
+<tr><td><tt>max</tt></td><td>Divide by maximum band value</td></tr>
+<tr><td><tt>minmax</tt></td><td>Map range to [0, 1]</td></tr>
+<tr><td><tt>vector</tt></td><td>Divide by L2 norm; unit vector in spectral space (equivalent to SAM denominator)</td></tr>
+</table>
+
+<h3>Point mode (<tt>-p</tt>)</h3>
+
+<p>When <tt>-p</tt> is set together with <tt>coordinates=east,north</tt>,
+<em>i.hyper.sleuth</em> extracts the spectrum at the given geographic location
+and prints a ranked similarity table for every requested method.  No raster
+output is produced.  Useful for validation, threshold selection, and
+understanding method behaviour before running a full-image analysis.</p>
+
+<h2>NOTES</h2>
+
+<h3>Input requirements</h3>
+<p>The module expects a 3D raster map with wavelength metadata stored in
+band-level metadata following the <em>i.hyper</em> standard:
+<b>wavelength</b>, <b>FWHM</b>, <b>valid</b>, and <b>unit</b>.  Such maps
+are produced by <em>i.hyper.import</em> or <em>i.hyper.atcorr</em>.</p>
+
+<p>All wavelengths must be in the same unit as the sensor metadata (typically
+nanometres for optical sensors).  The module automatically converts µm and
+m to nm when reading band metadata.</p>
+
+<p>Spectra must be in surface reflectance units (0–1 range).
+Top-of-atmosphere radiance or raw DN values will produce invalid results.</p>
+
+<h3>Output map types</h3>
+<p>All output maps are floating-point FCELL rasters in [0,&nbsp;1].  All maps
+share a blue → yellow → red colour ramp applied automatically via
+<em>r.colors</em> (0&nbsp;=&nbsp;blue, 0.5&nbsp;=&nbsp;yellow,
+1&nbsp;=&nbsp;red).</p>
+
+<h3>Performance</h3>
+<p>Methods <b>sam</b>, <b>sid</b>, <b>ed</b>, <b>sad</b>, <b>sca</b>,
+<b>jsd</b>, <b>bhatt</b>, <b>ssim</b>, <b>xcorr</b>, <b>gd1</b>,
+<b>gd2</b> are fully vectorised over the pixel dimension and are fast
+even for large images.</p>
+
+<p>Methods <b>mtf</b> and <b>cem</b> compute a full
+n<sub>bands</sub>&nbsp;×&nbsp;n<sub>bands</sub> covariance matrix; fast once
+built (Tikhonov regularisation prevents singularity).</p>
+
+<p>Method <b>dtw</b> uses a chunked Sakoe-Chiba rolling-window implementation
+(O(n·W) per pixel) with <tt>shift_window=</tt> controlling the maximum
+alignment warp.  For large images use a small <tt>shift_window</tt>
+(default&nbsp;3).</p>
+
+<p>Methods <b>cr_sam</b> and <b>cr_ed</b> perform a per-pixel convex-hull
+computation (Graham scan) and are approximately 10× slower than purely
+linear methods.  For a 1000 × 1000 image with 200 bands, expect several
+minutes.</p>
+
+<p>Method <b>consensus</b> runs all 16 base methods internally.  On the first
+run this is slow; subsequent runs can reuse cached maps when
+<tt>output_prefix=</tt> names already-computed rasters.</p>
+
+<h3>Multi-method and ensemble output</h3>
+<p>When multiple methods are listed in <tt>method=</tt> and
+<tt>output_prefix=</tt> is set, each method's similarity map is written as
+<tt>prefix_method</tt>.  The primary <tt>output=</tt> map contains the
+<b>consensus</b> or <b>ensemble</b> result if either is in the method list,
+otherwise the first listed method.</p>
+
+<h3>Threshold selection</h3>
+<p>Method-specific similarity thresholds vary.  As a rough guide for
+<b>sam</b>: 0.97 (≈5°) is a tight target match, 0.90 (≈26°) is loose.
+For probabilistic methods (<b>sid</b>, <b>jsd</b>, <b>bhatt</b>), values
+above 0.8 generally indicate strong similarity.  For <b>consensus</b>
+probability, &gt;&nbsp;0.7 is a conservative hotspot threshold; &gt;&nbsp;0.5
+is a candidate.  Use <tt>-p</tt> point mode on known target and background
+pixels to calibrate thresholds for your data.</p>
+
+<h2>EXAMPLES</h2>
+
+<h3>Find pixels matching a kaolinite spectrum (SAM)</h3>
+<div class="code"><pre>
+i.hyper.sleuth input=scene_atcorr output=kaolinite_sam \
+  reference_file=kaolinite_usgs.csv method=sam
+</pre></div>
+
+<h3>Full consensus analysis with all methods and diagnostic maps</h3>
+<div class="code"><pre>
+i.hyper.sleuth input=scene_atcorr output=hotspot \
+  reference_file=target.csv \
+  method=consensus fusion_mode=group_product \
+  output_prefix=tgt
+
+# Produces:
+#   tgt_consensus                   — hotspot probability
+#   tgt_consensus_agreement/entropy/conflict/spread  — diagnostics
+#   tgt_cal_sam, tgt_cal_sid, ...   — 16 calibrated probability maps
+#   tgt_sam, tgt_sid, ...           — 16 raw similarity maps
+</pre></div>
+
+<h3>Point inspection: all methods at one location</h3>
+<div class="code"><pre>
+i.hyper.sleuth input=scene_atcorr output=_ \
+  reference="450:0.04,670:0.05,800:0.42,2200:0.18" \
+  method=sam,sid,bhatt,dtw,mtf,consensus \
+  coordinates="452300,4325100" -p -v
+</pre></div>
+
+<h3>Six methods + ensemble, per-method maps, PCHIP resampling</h3>
+<div class="code"><pre>
+i.hyper.sleuth input=scene_atcorr output=best \
+  reference_file=chlorophyll_a.json \
+  method=sam,cr_sam,gd1,jsd,bhatt,ensemble \
+  output_prefix=chl normalize=minmax resample=pchip -c
+</pre></div>
+
+<h3>Subpixel mineral detection with CEM and MTF</h3>
+<div class="code"><pre>
+i.hyper.sleuth input=scene_atcorr output=kaolinite_sub \
+  reference_file=kaolinite_usgs.csv \
+  method=cem,mtf,ensemble output_prefix=kaolinite
+</pre></div>
+
+<h3>Consensus with Stouffer fusion and strict agreement threshold</h3>
+<div class="code"><pre>
+i.hyper.sleuth input=scene_atcorr output=hotspot_strict \
+  reference_file=chlorophyll_a.csv \
+  method=consensus fusion_mode=stouffer \
+  agreement_threshold=0.90 \
+  output_prefix=chl_strict
+</pre></div>
+
+<h3>Check band coverage and LUT diagnostics before processing</h3>
+<div class="code"><pre>
+i.hyper.sleuth input=scene_atcorr output=_ \
+  reference_file=target.csv method=sam -i
+
+# Console output (example):
+#   src [400-2500 nm, n=200] -> dst [350-2500 nm, n=242]
+#   overlap [400-2500 nm]
+#   edge-fill risk: 42 dst bands below src range (350-399 nm)
+#   unobservable: 0 src features outside dst range
+</pre></div>
+
+<h3>Restrict matching to SWIR for mineral identification</h3>
+<div class="code"><pre>
+i.hyper.sleuth input=scene_atcorr output=min_match \
+  reference_file=kaolinite_usgs.csv method=sam,cr_sam,gd2 \
+  min_wavelength=1000 max_wavelength=2500 output_prefix=min
+</pre></div>
+
+<h2>REFERENCES</h2>
+
+<ul>
+  <li>Kruse F.A., Lefkoff A.B., Boardman J.W., Heidebrecht K.B., Shapiro A.T.,
+      Barloon P.J., Goetz A.F.H. (1993): The spectral image processing system
+      (SIPS) — Interactive visualization and analysis of imaging spectrometer
+      data. <em>Remote Sensing of Environment</em>, 44, 145–163.</li>
+  <li>Chang C.I. (2000): An information-theoretic approach to spectral
+      variability, similarity, and discrimination for hyperspectral image
+      analysis. <em>IEEE Trans. Inf. Theory</em>, 46(5), 1927–1932.</li>
+  <li>Clark R.N., King T.V.V., Klejwa M., Swayze G.A. (1987): High spectral
+      resolution reflectance spectroscopy of minerals. <em>J. Geophys. Res.</em>,
+      92(B12), 12653–12680.</li>
+  <li>Reed I.S., Yu X. (1990): Adaptive multiple-band CFAR detection of an
+      optical pattern with unknown spectral distribution. <em>IEEE Trans.
+      Acoust. Speech Signal Process.</em>, 38(10), 1760–1770.</li>
+  <li>Chang C.I., Heinz D.C. (2000): Constrained subpixel target detection for
+      remotely sensed imagery. <em>IEEE Trans. Geosci. Remote Sens.</em>, 38(3),
+      1144–1159.</li>
+  <li>Wang Z., Bovik A.C., Sheikh H.R., Simoncelli E.P. (2004): Image quality
+      assessment: from error visibility to structural similarity. <em>IEEE
+      Trans. Image Process.</em>, 13(4), 600–612.</li>
+  <li>Sakoe H., Chiba S. (1978): Dynamic programming algorithm optimization for
+      spoken word recognition. <em>IEEE Trans. Acoust. Speech Signal
+      Process.</em>, 26(1), 43–49.</li>
+  <li>Fisher R.A. (1932): <em>Statistical Methods for Research Workers</em>,
+      4th ed. Oliver and Boyd, Edinburgh.</li>
+  <li>Stouffer S.A., Suchman E.A., DeVinney L.C., Star S.A., Williams R.M.
+      (1949): <em>The American Soldier: Adjustment During Army Life</em>, vol. 1.
+      Princeton University Press.</li>
+</ul>
+
+<h2>SEE ALSO</h2>
+
+<em>
+<a href="i.hyper.import.html">i.hyper.import</a>,
+<a href="i.hyper.atcorr.html">i.hyper.atcorr</a>,
+<a href="i.hyper.continuum.html">i.hyper.continuum</a>,
+<a href="i.hyper.spectroscopy.html">i.hyper.spectroscopy</a>,
+<a href="i.hyper.geology.html">i.hyper.geology</a>,
+<a href="r.mapcalc.html">r.mapcalc</a>,
+<a href="r.colors.html">r.colors</a>,
+<a href="r.univar.html">r.univar</a>,
+<a href="r3.info.html">r3.info</a>
+</em>
+
+<h2>AUTHORS</h2>
+
+<p>Written for the GRASS GIS i.hyper hyperspectral analysis module family.</p>
+
+</body>
+</html>
