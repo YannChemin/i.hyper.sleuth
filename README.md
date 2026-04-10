@@ -13,12 +13,12 @@ data processing in GRASS GIS.
 `i.hyper.sleuth` finds the pixels in a hyperspectral 3D raster that most
 closely match a user-supplied reference spectrum.  For each pixel a
 similarity score in **[0, 1]** (0 = no match, 1 = perfect match) is computed
-using one or more of **18 similarity methods** drawn from remote sensing,
+using one or more of **19 similarity methods** drawn from remote sensing,
 signal analysis, information theory, morphological mathematics, and
 subpixel-detection theory.
 
 The module also exposes a full **multi-method consensus pipeline**
-(`method=consensus`) that runs all base methods simultaneously, calibrates
+(`method=consensus`) that runs all 17 base methods simultaneously, calibrates
 their scores to true per-pixel probabilities via the empirical CDF rank
 transform, down-weights correlated methods using an inter-method diversity
 analysis, and fuses the result into a single hotspot probability map — plus
@@ -61,7 +61,7 @@ Reference spectra can be supplied inline, as CSV, or as JSON.
 
 When `consensus` is requested the module executes a four-step pipeline:
 
-1. **Compute all base methods** — all 16 methods except `ensemble`/`consensus`
+1. **Compute all base methods** — all 17 methods except `ensemble`/`consensus`
    are run against the cube (already-computed maps are reused).
 
 2. **Empirical CDF calibration** — each score map is rank-transformed to a
@@ -115,6 +115,131 @@ It also reports:
 
 ## Reference spectrum formats
 
+### Inline (`reference=`)
+
+Comma-separated `wavelength:reflectance` pairs passed directly on the
+command line.  Colons and semicolons are both accepted as pair separators;
+pairs may also be whitespace-delimited.  Scientific notation is supported.
+The list is sorted by wavelength before use.
+
+```bash
+# Colon separator, comma list (most common)
+reference="450:0.04,550:0.11,670:0.05,750:0.40,900:0.45,1650:0.22,2200:0.18"
+
+# Semicolon separator
+reference="450;0.04,550;0.11,670;0.05"
+
+# Whitespace list
+reference="450:0.04 550:0.11 670:0.05"
+
+# Scientific notation
+reference="4.5e2:4.0e-2,5.5e2:1.1e-1,8.0e2:4.0e-1"
+```
+
+At least 2 pairs are required.  Wavelength units must match the sensor
+metadata (typically nanometres).  Reflectance values should be in [0, 1]
+(surface reflectance); values > 2 trigger a warning that the data may be in
+percent reflectance.
+
+### CSV file (`reference_file=`)
+
+Two columns: `wavelength` and `reflectance`.  Any row whose first field is
+non-numeric (header line, comment, blank line) is silently skipped.
+Pairs are sorted by wavelength before use.  **Minimum 2 data rows required.**
+
+```csv
+wavelength,reflectance
+450,0.04
+550,0.11
+670,0.05
+750,0.40
+900,0.45
+1650,0.22
+2200,0.18
+```
+
+Header-less CSV is equally valid:
+
+```csv
+450,0.04
+550,0.11
+670,0.05
+```
+
+Lines beginning with `#` or other non-numeric text are treated as comments:
+
+```csv
+# kaolinite — USGS Spectral Library 7
+# wavelength (nm), reflectance [0-1]
+wavelength,reflectance
+2165,0.22
+2195,0.18
+2205,0.09
+2240,0.21
+2320,0.31
+```
+
+### JSON file (`reference_file=`)
+
+Four distinct JSON layouts are accepted:
+
+**1. Array of pairs** (most compact):
+
+```json
+[[450, 0.04], [550, 0.11], [670, 0.05], [800, 0.42], [2200, 0.18]]
+```
+
+**2. Parallel arrays** (ENVI / spectral library style):
+
+```json
+{
+    "wavelengths":  [450, 550, 670, 800, 2200],
+    "reflectances": [0.04, 0.11, 0.05, 0.42, 0.18]
+}
+```
+
+Key aliases accepted: `"wavelength"` or `"wl"` for the wavelength array;
+`"reflectance"` or `"r"` for the reflectance array.
+
+**3. Named list** (`"data"`, `"spectrum"`, or `"pairs"` key):
+
+```json
+{"data": [[450, 0.04], [550, 0.11], [670, 0.05]]}
+```
+
+```json
+{"spectrum": [[450, 0.04], [550, 0.11], [670, 0.05]]}
+```
+
+**4. Nested object with mixed keys** (custom export formats):
+
+```json
+{
+    "wl": [450, 550, 670, 800],
+    "r":  [0.04, 0.11, 0.05, 0.42]
+}
+```
+
+All JSON variants are sorted by wavelength before use.
+
+### Wavelength units
+
+The reference wavelengths must be in the same units as the sensor band
+metadata (usually **nanometres**).  The following unit strings in the band
+metadata are converted automatically to nm: `um` / `µm` / `micrometer`,
+`m` / `meter`.  If your reference file is in µm (e.g., USGS `.asc` exports),
+convert before passing:
+
+```bash
+# Convert USGS µm → nm in a quick Python one-liner
+python3 -c "
+import csv, sys
+for row in csv.reader(open('kaolinite.csv')):
+    try: print(f'{float(row[0])*1000:.2f},{row[1]}')
+    except: print(','.join(row))
+" > kaolinite_nm.csv
+```
+
 | Format | Description |
 |--------|-------------|
 | `reference=` | Inline `wl:r,wl:r,...` pairs on the command line |
@@ -164,6 +289,25 @@ i.hyper.sleuth input=scene_atcorr output=best \
 
 ---
 
+## Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `input=` | — | Input hyperspectral 3D raster (from `i.hyper.import` / `i.hyper.atcorr`) |
+| `output=` | — | Output similarity raster map (FCELL, [0, 1]) |
+| `reference=` | — | Inline `wl:r,...` spectrum (mutually exclusive with `reference_file=`) |
+| `reference_file=` | — | CSV or JSON spectrum file (mutually exclusive with `reference=`) |
+| `method=` | `sam` | Comma-separated list of methods (see table above) |
+| `fusion_mode=` | `rank_product` | Fusion strategy for `method=consensus` |
+| `agreement_threshold=` | `0.80` | Calibrated-probability threshold for per-pixel agreement count (consensus only) |
+| `output_prefix=` | — | Prefix for per-method output maps; enables map caching in consensus |
+| `resample=` | `linear` | Interpolation for resampling reference to sensor grid: `linear`, `cubic`, `pchip` |
+| `normalize=` | `none` | Spectrum normalisation before matching: `none`, `area`, `max`, `minmax`, `vector` |
+| `shift_window=` | `3` | Maximum band-shift for shift-tolerant methods (`xcorr`, `dtw`); 0 disables |
+| `min_wavelength=` | — | Lower wavelength limit (nm); restricts matching to overlap region |
+| `max_wavelength=` | — | Upper wavelength limit (nm); restricts matching to overlap region |
+| `coordinates=` | — | `east,north` for point-mode analysis (requires `-p`) |
+
 ## Flags
 
 | Flag | Effect |
@@ -185,7 +329,7 @@ i.hyper.sleuth input=scene_atcorr output=best \
 | `mtf`, `cem` | Fast | One k×k covariance inversion, then linear |
 | `dtw` | Moderate | Chunked Sakoe-Chiba rolling-window; controlled by `shift_window=` |
 | `cr_sam`, `cr_ed` | Slow | Per-pixel Graham-scan convex hull |
-| `consensus` | Slow (first run) | Runs all 16 base methods; subsequent runs with `output_prefix=` reuse cached maps |
+| `consensus` | Slow (first run) | Runs all 17 base methods; subsequent runs with `output_prefix=` reuse cached maps |
 
 ---
 

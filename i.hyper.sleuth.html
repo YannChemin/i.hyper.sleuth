@@ -11,7 +11,7 @@
 <p><em>i.hyper.sleuth</em> finds the pixels in a hyperspectral 3D raster that
 most closely match a user-supplied reference spectrum.  For each pixel the
 module computes a similarity score in [0,&nbsp;1] (0&nbsp;=&nbsp;no match,
-1&nbsp;=&nbsp;perfect match) using one or more of <b>18 spectral-similarity
+1&nbsp;=&nbsp;perfect match) using one or more of <b>19 spectral-similarity
 methods</b> drawn from remote sensing, signal analysis, information theory,
 morphological mathematics, and subpixel-detection theory.</p>
 
@@ -22,7 +22,7 @@ O(<em>n</em>) per pixel, no repeated binary search).  Optional preprocessing
 applied identically to the reference and to every pixel before matching.</p>
 
 <p>The module also exposes a full <b>multi-method consensus pipeline</b>
-(<tt>method=consensus</tt>) that runs all 16 base methods simultaneously,
+(<tt>method=consensus</tt>) that runs all 17 base methods simultaneously,
 calibrates each score map to a true per-pixel probability via an empirical
 CDF rank transform, down-weights correlated methods using an inter-method
 diversity analysis, and fuses the result into a single hotspot probability
@@ -36,24 +36,111 @@ or <a href="i.hyper.atcorr.html">i.hyper.atcorr</a>.</p>
 <h3>Reference spectrum formats</h3>
 
 <h4>Inline (<tt>reference=</tt>)</h4>
-<p>Comma-separated <tt>wavelength:reflectance</tt> pairs:</p>
+<p>Comma-separated <tt>wavelength:reflectance</tt> pairs passed directly as a
+command option.  Colons and semicolons are both accepted as pair separators;
+pairs may also be whitespace-delimited.  Scientific notation is supported.
+The list is sorted by wavelength before use.  At least 2 pairs are required.</p>
+
 <div class="code"><pre>
+# Colon separator, comma list (most common)
 reference="450:0.04,550:0.11,670:0.05,750:0.40,900:0.45,1650:0.22,2200:0.18"
+
+# Semicolon separator
+reference="450;0.04,550;0.11,670;0.05"
+
+# Whitespace-separated list
+reference="450:0.04 550:0.11 670:0.05"
+
+# Scientific notation
+reference="4.5e2:4.0e-2,5.5e2:1.1e-1,8.0e2:4.0e-1"
 </pre></div>
-<p>Semicolons are also accepted as the pair separator.</p>
+
+<p>Reflectance values should be in [0,&nbsp;1] (surface reflectance).  Values
+above 2 trigger a warning that the data may be in percent&nbsp;reflectance.</p>
 
 <h4>CSV file (<tt>reference_file=</tt>)</h4>
-<p>Two columns <tt>wavelength,reflectance</tt>, one pair per line.
-An optional header row (non-numeric first field) is skipped automatically.
-Wavelength units must match the sensor metadata (nanometres by default).</p>
+<p>Two columns: <tt>wavelength</tt> and <tt>reflectance</tt>.  Any row whose
+first field is non-numeric (header line, comment, blank line) is silently
+skipped.  Pairs are sorted by wavelength before use.  At least 2 data rows
+are required.</p>
+
+<p><b>With header:</b></p>
+<div class="code"><pre>
+wavelength,reflectance
+450,0.04
+550,0.11
+670,0.05
+800,0.42
+2200,0.18
+</pre></div>
+
+<p><b>Header-less:</b></p>
+<div class="code"><pre>
+450,0.04
+550,0.11
+670,0.05
+</pre></div>
+
+<p><b>With comment lines</b> (non-numeric rows are skipped automatically):</p>
+<div class="code"><pre>
+# kaolinite -- USGS Spectral Library 7
+# wavelength (nm), reflectance [0-1]
+wavelength,reflectance
+2165,0.22
+2195,0.18
+2205,0.09
+2240,0.21
+2320,0.31
+</pre></div>
 
 <h4>JSON file (<tt>reference_file=</tt>)</h4>
-<p>Any of the following layouts are accepted:</p>
-<ul>
-  <li><tt>[[wl, r], [wl, r], ...]</tt></li>
-  <li><tt>{"wavelengths": [...], "reflectances": [...]}</tt></li>
-  <li><tt>{"data": [[wl, r], ...]}</tt></li>
-</ul>
+<p>Four distinct JSON layouts are accepted:</p>
+
+<p><b>1. Array of pairs</b> (compact):</p>
+<div class="code"><pre>
+[[450, 0.04], [550, 0.11], [670, 0.05], [800, 0.42], [2200, 0.18]]
+</pre></div>
+
+<p><b>2. Parallel arrays</b> (ENVI / spectral library style):</p>
+<div class="code"><pre>
+{
+    "wavelengths":  [450, 550, 670, 800, 2200],
+    "reflectances": [0.04, 0.11, 0.05, 0.42, 0.18]
+}
+</pre></div>
+<p>Key aliases accepted: <tt>"wavelength"</tt> or <tt>"wl"</tt> for the
+wavelength array; <tt>"reflectance"</tt> or <tt>"r"</tt> for the reflectance
+array.</p>
+
+<p><b>3. Named list</b> (<tt>"data"</tt>, <tt>"spectrum"</tt>, or
+<tt>"pairs"</tt> key):</p>
+<div class="code"><pre>
+{"data":     [[450, 0.04], [550, 0.11], [670, 0.05]]}
+{"spectrum": [[450, 0.04], [550, 0.11], [670, 0.05]]}
+{"pairs":    [[450, 0.04], [550, 0.11], [670, 0.05]]}
+</pre></div>
+
+<p><b>4. Short-key parallel arrays:</b></p>
+<div class="code"><pre>
+{"wl": [450, 550, 670, 800], "r": [0.04, 0.11, 0.05, 0.42]}
+</pre></div>
+
+<p>All JSON variants are sorted by wavelength before use.</p>
+
+<h4>Wavelength units</h4>
+<p>Reference wavelengths must be in the same units as the sensor band metadata
+(usually <b>nanometres</b>).  The following unit strings in band metadata are
+converted automatically to nm: <tt>um</tt>&nbsp;/&nbsp;<tt>µm</tt>&nbsp;/&nbsp;<tt>micrometer</tt>,
+<tt>m</tt>&nbsp;/&nbsp;<tt>meter</tt>.  If your reference file uses µm
+(e.g., USGS <tt>.asc</tt> exports), convert before use:</p>
+<div class="code"><pre>
+python3 -c "
+import csv
+for row in csv.reader(open('kaolinite.csv')):
+    try: print(f'{float(row[0])*1000:.2f},{row[1]}')
+    except: print(','.join(row))
+" > kaolinite_nm.csv
+</pre></div>
 
 <h3>Similarity methods</h3>
 
@@ -157,7 +244,7 @@ Wavelength units must match the sensor metadata (nanometres by default).</p>
   reduces sensitivity to any single method's failure mode.</td></tr>
 
 <tr><td><b>consensus</b></td><td>Calibrated Probability Fusion</td><td>Meta-method</td>
-  <td>Four-step pipeline: (1)&nbsp;run all 16 base methods; (2)&nbsp;CDF
+  <td>Four-step pipeline: (1)&nbsp;run all 17 base methods; (2)&nbsp;CDF
   rank-calibrate each map to a true probability; (3)&nbsp;compute
   inter-method diversity weights; (4)&nbsp;fuse via the selected
   <tt>fusion_mode</tt>.  Produces a hotspot probability map plus four
@@ -171,7 +258,7 @@ Wavelength units must match the sensor metadata (nanometres by default).</p>
 pipeline:</p>
 
 <ol>
-<li><b>Compute all base methods.</b>  All 16 methods (excluding
+<li><b>Compute all base methods.</b>  All 17 methods (excluding
   <tt>ensemble</tt>/<tt>consensus</tt>) are run against the cube.
   Already-computed maps identified via <tt>output_prefix=</tt> are
   reused.</li>
@@ -233,7 +320,7 @@ addition to the primary <tt>output=</tt> hotspot probability map:</p>
 <tr><td><tt>{prefix}_consensus_spread</tt></td>
     <td>Standard deviation of calibrated scores per pixel</td></tr>
 <tr><td><tt>{prefix}_cal_{method}</tt></td>
-    <td>Rank-calibrated probability for each of the 16 base methods</td></tr>
+    <td>Rank-calibrated probability for each of the 17 base methods</td></tr>
 <tr><td><tt>{prefix}_{method}</tt></td>
     <td>Raw similarity score for each base method</td></tr>
 </table>
@@ -256,6 +343,59 @@ any pixel processing:</p>
 </ul>
 <p>Use <tt>-i</tt> (info mode) to inspect the coverage report before
 processing.</p>
+
+<h3>Parameters</h3>
+
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Parameter</th><th>Default</th><th>Description</th></tr>
+<tr><td><tt>input=</tt></td><td>—</td>
+  <td>Input hyperspectral 3D raster (produced by <em>i.hyper.import</em> or <em>i.hyper.atcorr</em>)</td></tr>
+<tr><td><tt>output=</tt></td><td>—</td>
+  <td>Output similarity map (FCELL, [0,&nbsp;1])</td></tr>
+<tr><td><tt>reference=</tt></td><td>—</td>
+  <td>Inline <tt>wl:r,…</tt> spectrum string; mutually exclusive with <tt>reference_file=</tt></td></tr>
+<tr><td><tt>reference_file=</tt></td><td>—</td>
+  <td>Path to CSV or JSON spectrum file; mutually exclusive with <tt>reference=</tt></td></tr>
+<tr><td><tt>method=</tt></td><td><tt>sam</tt></td>
+  <td>Comma-separated list of similarity methods (see table above)</td></tr>
+<tr><td><tt>fusion_mode=</tt></td><td><tt>rank_product</tt></td>
+  <td>Fusion strategy for <tt>method=consensus</tt></td></tr>
+<tr><td><tt>agreement_threshold=</tt></td><td><tt>0.80</tt></td>
+  <td>Calibrated-probability threshold for the per-pixel agreement count (consensus only)</td></tr>
+<tr><td><tt>output_prefix=</tt></td><td>—</td>
+  <td>Prefix for per-method output maps; enables map caching in consensus</td></tr>
+<tr><td><tt>resample=</tt></td><td><tt>linear</tt></td>
+  <td>Interpolation for resampling the reference spectrum to the sensor wavelength grid:
+  <tt>linear</tt>, <tt>cubic</tt>, <tt>pchip</tt></td></tr>
+<tr><td><tt>normalize=</tt></td><td><tt>none</tt></td>
+  <td>Spectrum normalisation before matching: <tt>none</tt>, <tt>area</tt>, <tt>max</tt>,
+  <tt>minmax</tt>, <tt>vector</tt> (see Normalization options)</td></tr>
+<tr><td><tt>shift_window=</tt></td><td><tt>3</tt></td>
+  <td>Maximum band-shift for shift-tolerant methods (<tt>xcorr</tt>, <tt>dtw</tt>);
+  0 disables shifting</td></tr>
+<tr><td><tt>min_wavelength=</tt></td><td>—</td>
+  <td>Lower wavelength limit (nm); restricts matching to the sensor/reference overlap</td></tr>
+<tr><td><tt>max_wavelength=</tt></td><td>—</td>
+  <td>Upper wavelength limit (nm); restricts matching to the sensor/reference overlap</td></tr>
+<tr><td><tt>coordinates=</tt></td><td>—</td>
+  <td><tt>east,north</tt> for single-pixel point-mode analysis (requires <tt>-p</tt>)</td></tr>
+</table>
+
+<h3>Flags</h3>
+
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Flag</th><th>Effect</th></tr>
+<tr><td><b>-n</b></td><td>Only use bands marked <tt>valid=1</tt> in band metadata</td></tr>
+<tr><td><b>-i</b></td><td>Info mode: print band coverage and LUT summary, then exit</td></tr>
+<tr><td><b>-v</b></td>
+  <td>Verbose: per-method scores in point mode; correlation matrix and diversity weights in consensus mode</td></tr>
+<tr><td><b>-c</b></td>
+  <td>Apply upper-convex-hull continuum removal to both reference and pixel spectra before matching</td></tr>
+<tr><td><b>-p</b></td>
+  <td>Point mode: extract spectrum at <tt>coordinates=</tt> and print a ranked per-method score table</td></tr>
+<tr><td><b>-z</b></td>
+  <td>Normalise both reference and pixel spectra to the probability simplex (sum-to-one) before matching</td></tr>
+</table>
 
 <h3>Preprocessing flags</h3>
 
@@ -332,7 +472,7 @@ computation (Graham scan) and are approximately 10× slower than purely
 linear methods.  For a 1000 × 1000 image with 200 bands, expect several
 minutes.</p>
 
-<p>Method <b>consensus</b> runs all 16 base methods internally.  On the first
+<p>Method <b>consensus</b> runs all 17 base methods internally.  On the first
 run this is slow; subsequent runs can reuse cached maps when
 <tt>output_prefix=</tt> names already-computed rasters.</p>
 
@@ -371,7 +511,7 @@ i.hyper.sleuth input=scene_atcorr output=hotspot \
 #   tgt_consensus                   — hotspot probability
 #   tgt_consensus_agreement/entropy/conflict/spread  — diagnostics
 #   tgt_cal_sam, tgt_cal_sid, ...   — 16 calibrated probability maps
-#   tgt_sam, tgt_sid, ...           — 16 raw similarity maps
+#   tgt_sam, tgt_sid, ...           — 17 raw similarity maps
 </pre></div>
 
 <h3>Point inspection: all methods at one location</h3>
@@ -473,7 +613,9 @@ i.hyper.sleuth input=scene_atcorr output=min_match \
 
 <h2>AUTHORS</h2>
 
-<p>Written for the GRASS GIS i.hyper hyperspectral analysis module family.</p>
+<p>Yann Chemin, GRASS Development Team.<br>
+Part of the <em>i.hyper</em> module family for VNIR-SWIR hyperspectral data
+processing in GRASS GIS.</p>
 
 </body>
 </html>

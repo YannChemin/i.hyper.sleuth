@@ -267,6 +267,11 @@ _TMP_RASTERS: list[str] = []
 
 
 def _cleanup():
+    """Remove all temporary rasters registered during this session.
+
+    Registered via :func:`_tmp`.  Called automatically at exit via
+    ``atexit``.
+    """
     if _TMP_RASTERS:
         gs.run_command('g.remove', type='raster',
                        name=','.join(_TMP_RASTERS), flags='f', quiet=True)
@@ -276,6 +281,12 @@ atexit.register(_cleanup)
 
 
 def _tmp(label: str) -> str:
+    """Return a unique temporary raster name and register it for cleanup.
+
+    :param str label: descriptive suffix used to build the name
+    :return: temporary raster name guaranteed unique within this process
+    :rtype: str
+    """
     name = f"tmp_ihsleuth_{os.getpid()}_{label}"
     _TMP_RASTERS.append(name)
     return name
@@ -288,6 +299,15 @@ _G3D_LIB = None
 
 
 def _load_g3d_lib():
+    """Load ``libgrass_g3d`` via ctypes and configure the ``Rast3d_extract_z_slice`` prototype.
+
+    Called lazily the first time a band extraction is requested.
+    Caches the library handle in the module-level ``_G3D_LIB`` variable so
+    subsequent calls return immediately.
+
+    :return: ctypes handle to ``libgrass_g3d``
+    :raises SystemExit: via ``gs.fatal`` if the library cannot be loaded
+    """
     global _G3D_LIB
     if _G3D_LIB is not None:
         return _G3D_LIB
@@ -319,7 +339,18 @@ def _load_g3d_lib():
 
 
 def extract_band(raster3d: str, band_num: int) -> str:
-    """Extract band_num (1-based) from raster3d to a temp 2D raster."""
+    """Extract one Z-slice from a 3D raster into a temporary 2D raster.
+
+    Uses ``Rast3d_extract_z_slice`` from ``libgrass_g3d`` via ctypes.
+    Only the tiles covering the target depth level are read from disk;
+    this is O(tile) rather than O(voxel) like the default cache API.
+
+    :param str raster3d: name of the input 3D raster map (``@mapset`` optional)
+    :param int band_num: 1-based band (depth) index to extract
+    :return: name of the newly created temporary 2D raster
+    :rtype: str
+    :raises SystemExit: via ``gs.fatal`` if ``Rast3d_extract_z_slice`` fails
+    """
     lib = _load_g3d_lib()
     z = band_num - 1
     base = raster3d.replace('@', '_').replace('#', '_').replace('.', '_')
@@ -341,7 +372,15 @@ def extract_band(raster3d: str, band_num: int) -> str:
 
 
 def _parse_wl_from_r3info(raster3d: str) -> dict[int, tuple]:
-    """Parse Band N: WL nm, FWHM: F nm lines from r3.info history."""
+    """Parse wavelength/FWHM pairs from ``r3.info`` history text.
+
+    Looks for lines of the form ``Band N: WL nm, FWHM: F nm`` as written by
+    ``i.hyper.import``'s direct 3D-raster import workflow.
+
+    :param str raster3d: name of the 3D raster map
+    :return: dict mapping band index (int, 1-based) to ``(wavelength_nm, fwhm_nm)``
+    :rtype: dict[int, tuple[float, float]]
+    """
     try:
         info_text = gs.read_command('r3.info', flags='h', map=raster3d)
     except Exception:
@@ -359,6 +398,17 @@ def _parse_wl_from_r3info(raster3d: str) -> dict[int, tuple]:
 
 
 def _convert_wl_nm(wl: float, unit: str) -> float:
+    """Convert a wavelength value to nanometres.
+
+    Accepted unit strings: ``nm`` / ``nanometer(s)``, ``um`` / ``µm`` /
+    ``micrometer(s)`` / ``micron(s)``, ``m`` / ``meter(s)``.
+    Any unrecognised unit emits a warning and is treated as nm.
+
+    :param float wl: wavelength value in the given unit
+    :param str unit: unit string (case-insensitive)
+    :return: wavelength in nanometres
+    :rtype: float
+    """
     u = unit.lower().strip()
     if u in ('nm', 'nanometer', 'nanometers'):
         return wl
@@ -373,7 +423,28 @@ def _convert_wl_nm(wl: float, unit: str) -> float:
 def get_band_info(raster3d: str, only_valid: bool = False,
                   min_wl: Optional[float] = None,
                   max_wl: Optional[float] = None) -> list[dict]:
-    """Return sorted list of band dicts with keys: band, wavelength, fwhm, valid, map_name."""
+    """Return per-band metadata for all usable bands in a 3D raster.
+
+    Reads wavelength, FWHM, and validity from band-level metadata.  Two
+    metadata sources are tried in order:
+
+    1. **2D band-slice rasters** (``{name}#N``) created by ``i.hyper.import`` —
+       ``r.info -h`` metadata is authoritative.
+    2. ``r3.info`` history text — fallback for rasters imported via ``r3.in.bin``
+       or similar workflows.
+
+    :param str raster3d: name of the 3D raster map (``@mapset`` optional)
+    :param bool only_valid: if ``True``, exclude bands with ``valid=0`` in metadata
+    :param min_wl: discard bands below this wavelength (nm); ``None`` = no limit
+    :type min_wl: float or None
+    :param max_wl: discard bands above this wavelength (nm); ``None`` = no limit
+    :type max_wl: float or None
+    :return: list of band dicts sorted by wavelength, each with keys
+             ``band`` (1-based int), ``wavelength`` (nm float), ``fwhm`` (nm float),
+             ``valid`` (bool), ``map_name`` (str or None)
+    :rtype: list[dict]
+    :raises SystemExit: via ``gs.fatal`` if no wavelength metadata is found
+    """
     info = gs.raster3d_info(raster3d)
     depths = int(info['depths'])
 
@@ -446,7 +517,23 @@ def get_band_info(raster3d: str, only_valid: bool = False,
 
 
 def parse_reference_inline(text: str) -> tuple[np.ndarray, np.ndarray]:
-    """Parse 'wl1:r1,wl2:r2,...' or 'wl1;r1,wl2;r2,...' inline string."""
+    """Parse an inline ``wavelength:reflectance`` string into NumPy arrays.
+
+    Accepted formats::
+
+        "450:0.04,670:0.05,800:0.42"          # colon separator, comma list
+        "450;0.04,670;0.05,800;0.42"          # semicolon separator
+        "450:0.04 670:0.05 800:0.42"          # whitespace list
+        "4.50e2:4e-2, 8.0e2:0.42"             # scientific notation
+
+    Pairs are sorted by wavelength before return.  At least 2 pairs are
+    required.
+
+    :param str text: the raw ``reference=`` option value
+    :return: tuple ``(wavelengths, reflectances)`` as 1-D float64 arrays
+    :rtype: tuple[np.ndarray, np.ndarray]
+    :raises SystemExit: via ``gs.fatal`` if fewer than 2 valid pairs are found
+    """
     pairs = []
     for tok in re.split(r'[,\s]+', text.strip()):
         tok = tok.strip()
@@ -465,11 +552,52 @@ def parse_reference_inline(text: str) -> tuple[np.ndarray, np.ndarray]:
 
 
 def parse_reference_file(path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Parse CSV or JSON reference spectrum file.
+    """Parse a reference spectrum from a CSV or JSON file.
 
-    CSV: wavelength,reflectance rows (with or without header).
-    JSON: [[wl, r], ...] or {"wavelengths": [...], "reflectances": [...]}
-        or {"data": [[wl, r], ...]} or {"spectrum": [[wl, r], ...]}
+    The function auto-detects the format.  JSON is tried first; on failure
+    the file is re-read as CSV.
+
+    **CSV format**
+
+    Two columns: ``wavelength,reflectance``.  Any row whose first field is
+    non-numeric (header, comment) is silently skipped::
+
+        wavelength,reflectance
+        450,0.04
+        670,0.05
+        800,0.42
+
+    Any delimiter recognised by Python's ``csv.reader`` is accepted (comma,
+    tab, semicolon via the sniffer).
+
+    **JSON formats**
+
+    All of the following layouts are accepted:
+
+    *Array of pairs*::
+
+        [[450, 0.04], [670, 0.05], [800, 0.42]]
+
+    *Parallel arrays*::
+
+        {"wavelengths": [450, 670, 800],
+         "reflectances": [0.04, 0.05, 0.42]}
+
+    Aliases: ``"wavelength"`` / ``"wl"`` for the wavelength key;
+    ``"reflectance"`` / ``"r"`` for the reflectance key.
+
+    *Named list*::
+
+        {"data": [[450, 0.04], [670, 0.05]]}
+        {"spectrum": [[450, 0.04], [670, 0.05]]}
+        {"pairs": [[450, 0.04], [670, 0.05]]}
+
+    :param str path: absolute or relative path to the spectrum file
+    :return: tuple ``(wavelengths, reflectances)`` sorted by wavelength,
+             as 1-D float64 arrays
+    :rtype: tuple[np.ndarray, np.ndarray]
+    :raises SystemExit: via ``gs.fatal`` if the file is missing, the format
+                        is unrecognised, or fewer than 2 pairs are parsed
     """
     if not os.path.isfile(path):
         gs.fatal(f"Reference file not found: {path}")
@@ -729,11 +857,26 @@ def resample_reference(ref_wls: np.ndarray, ref_vals: np.ndarray,
                        sensor_wls: np.ndarray,
                        method: str = 'linear',
                        lut: Optional['WavelengthLUT'] = None) -> np.ndarray:
-    """Resample reference spectrum to the sensor wavelength grid.
+    """Resample a reference spectrum onto the sensor wavelength grid.
 
-    For ``method='linear'`` a pre-built :class:`WavelengthLUT` can be passed
-    to skip index recomputation.  For cubic/pchip the LUT is not used but
-    its overlap mask is honoured to avoid extrapolation artefacts.
+    For ``method='linear'`` a pre-built :class:`WavelengthLUT` is used when
+    provided, avoiding redundant index computation.  For ``'cubic'`` /
+    ``'pchip'``, ``scipy.interpolate`` is used with a NaN fall-back to linear
+    for any out-of-range sensor bands.
+
+    :param ref_wls: reference wavelengths (nm), strictly increasing
+    :type ref_wls: np.ndarray, shape (n_ref,)
+    :param ref_vals: reference reflectance values
+    :type ref_vals: np.ndarray, shape (n_ref,)
+    :param sensor_wls: sensor band centre wavelengths (nm), strictly increasing
+    :type sensor_wls: np.ndarray, shape (n_bands,)
+    :param str method: interpolation method — ``'linear'`` (default),
+                       ``'cubic'`` (requires scipy), or ``'pchip'`` (requires scipy)
+    :param lut: optional pre-built LUT; built internally if ``None``
+    :type lut: WavelengthLUT or None
+    :return: resampled reflectance at each sensor band
+    :rtype: np.ndarray, shape (n_bands,) float64
+    :raises SystemExit: via ``gs.fatal`` for unknown *method*
     """
     if method == 'linear':
         if lut is None:
@@ -779,10 +922,18 @@ def resample_reference(ref_wls: np.ndarray, ref_vals: np.ndarray,
 
 def load_cube(bands: list[dict], raster3d: str,
               verbose: bool = False) -> np.ndarray:
-    """Load all bands into a float32 numpy array (n_bands, rows, cols).
+    """Load all bands into a ``(n_bands, rows, cols)`` float32 NumPy array.
 
-    Uses garray for 2D raster reading.  Band slice rasters are extracted from
-    the 3D raster on demand when map_name is None.
+    Reads each band via ``grass.script.array.array`` (garray).  If
+    ``band['map_name']`` is ``None`` (no pre-existing 2D slice), the slice is
+    extracted on-the-fly with :func:`extract_band` and the dict is updated.
+
+    :param bands: list of band dicts from :func:`get_band_info`
+    :type bands: list[dict]
+    :param str raster3d: name of the source 3D raster (used when extracting slices)
+    :param bool verbose: if ``True``, log each band as it is loaded
+    :return: hyperspectral cube, axes ``(n_bands, rows, cols)``
+    :rtype: np.ndarray, dtype float32
     """
     import grass.script.array as garray
 
@@ -815,7 +966,19 @@ def load_cube(bands: list[dict], raster3d: str,
 
 def read_pixel_spectrum(bands: list[dict], raster3d: str,
                         east: float, north: float) -> np.ndarray:
-    """Extract the spectrum at a single geographic coordinate."""
+    """Extract the reflectance spectrum at one geographic coordinate.
+
+    Calls ``r.what`` for each band map in *bands*.  Used in point mode
+    (``-p`` flag) to inspect a single pixel before running a full analysis.
+
+    :param bands: list of band dicts from :func:`get_band_info`
+    :type bands: list[dict]
+    :param str raster3d: source 3D raster name (used for on-demand extraction)
+    :param float east: easting coordinate (map units)
+    :param float north: northing coordinate (map units)
+    :return: reflectance values, one per band; NaN where ``r.what`` returns NULL
+    :rtype: np.ndarray, shape (n_bands,) float64
+    """
     coords = f"{east},{north}"
     spec = []
     for b in bands:
@@ -840,7 +1003,13 @@ def read_pixel_spectrum(bands: list[dict], raster3d: str,
 
 
 def write_raster(data: np.ndarray, name: str, overwrite: bool = True) -> None:
-    """Write a 2D numpy array as a GRASS raster."""
+    """Write a 2-D NumPy array as a GRASS FCELL (float) raster.
+
+    :param data: similarity or probability values to write
+    :type data: np.ndarray, shape (rows, cols)
+    :param str name: output GRASS raster map name
+    :param bool overwrite: overwrite an existing map with the same name
+    """
     import grass.script.array as garray
     arr = garray.array()
     arr[:] = data.astype(np.float64)
@@ -852,7 +1021,24 @@ def write_raster(data: np.ndarray, name: str, overwrite: bool = True) -> None:
 
 
 def normalize_spectrum(spec: np.ndarray, method: str) -> np.ndarray:
-    """Normalize a 1-D spectrum array."""
+    """Normalize a 1-D spectrum to remove magnitude / range bias.
+
+    :param spec: input reflectance values
+    :type spec: np.ndarray, shape (n_bands,)
+    :param str method: one of ``'none'``, ``'area'``, ``'max'``,
+                       ``'minmax'``, ``'vector'``
+    :return: normalized spectrum (copy of *spec* if method is ``'none'``)
+    :rtype: np.ndarray, shape (n_bands,) float64
+    :raises SystemExit: via ``gs.fatal`` for unknown *method*
+
+    Method definitions:
+
+    * ``none``   — return as-is (no copy)
+    * ``area``   — divide by spectral sum (total power = 1)
+    * ``max``    — divide by maximum band value
+    * ``minmax`` — scale range to [0, 1]
+    * ``vector`` — divide by L2 norm (unit vector; equivalent to SAM denominator)
+    """
     if method == 'none':
         return spec
     s = spec.copy()
@@ -880,7 +1066,18 @@ def normalize_spectrum(spec: np.ndarray, method: str) -> np.ndarray:
 
 
 def normalize_cube(cube: np.ndarray, method: str) -> np.ndarray:
-    """Normalize a (n_bands, rows, cols) cube along the band axis."""
+    """Normalize a hyperspectral cube along the band axis.
+
+    Applies the same normalization as :func:`normalize_spectrum` but
+    vectorized over all pixels simultaneously.
+
+    :param cube: hyperspectral data
+    :type cube: np.ndarray, shape (n_bands, rows, cols)
+    :param str method: one of ``'none'``, ``'area'``, ``'max'``,
+                       ``'minmax'``, ``'vector'``
+    :return: normalized cube (copy; input is not modified)
+    :rtype: np.ndarray, shape (n_bands, rows, cols)
+    """
     if method == 'none':
         return cube
     c = cube.copy()
@@ -905,13 +1102,31 @@ def normalize_cube(cube: np.ndarray, method: str) -> np.ndarray:
 
 
 def to_prob_simplex(spec: np.ndarray) -> np.ndarray:
-    """Normalize 1-D spectrum to the probability simplex (sum to 1, all ≥ 0)."""
+    """Project a 1-D spectrum onto the probability simplex.
+
+    Clips negative values to 1e-12 then divides by the sum so that the result
+    sums to 1 and all values are strictly positive.  Required by SID, JSD, and
+    Bhattacharyya which treat spectra as discrete probability distributions.
+
+    :param spec: reflectance values (any non-negative scale)
+    :type spec: np.ndarray, shape (n_bands,)
+    :return: probability distribution over bands summing to 1
+    :rtype: np.ndarray, shape (n_bands,) float64
+    """
     s = np.maximum(spec, 1e-12)
     return s / s.sum()
 
 
 def to_prob_simplex_cube(cube: np.ndarray) -> np.ndarray:
-    """Normalize cube band-axis to probability simplex per pixel."""
+    """Project every pixel spectrum in a cube onto the probability simplex.
+
+    Vectorized equivalent of :func:`to_prob_simplex` applied along the band axis.
+
+    :param cube: hyperspectral data
+    :type cube: np.ndarray, shape (n_bands, rows, cols)
+    :return: probability distributions; each pixel sums to 1 along axis 0
+    :rtype: np.ndarray, shape (n_bands, rows, cols) float64
+    """
     c = np.maximum(cube, 1e-12)
     totals = c.sum(axis=0, keepdims=True)
     return c / totals
@@ -923,10 +1138,19 @@ def to_prob_simplex_cube(cube: np.ndarray) -> np.ndarray:
 
 def _upper_hull(wavelengths: np.ndarray,
                 reflectances: np.ndarray) -> np.ndarray:
-    """Compute the upper convex hull (continuum) for one spectrum.
+    """Compute the upper convex hull (continuum line) for one spectrum.
 
-    Returns an array of continuum values at each wavelength position.
-    Uses the Graham-scan upper hull algorithm.
+    Implements the Graham-scan upper-hull algorithm: processes (wavelength,
+    reflectance) pairs left-to-right and removes points that would create a
+    concave turn, keeping only the convex upper boundary.  The result is
+    interpolated back to the original wavelength positions.
+
+    :param wavelengths: sensor band centres (nm), strictly increasing
+    :type wavelengths: np.ndarray, shape (n_bands,)
+    :param reflectances: reflectance values at each band
+    :type reflectances: np.ndarray, shape (n_bands,)
+    :return: continuum (hull) value at each band position
+    :rtype: np.ndarray, shape (n_bands,) float64
     """
     pts = list(zip(wavelengths.tolist(), reflectances.tolist()))
     # Graham scan: upper hull (points visible from above)
@@ -947,7 +1171,19 @@ def _upper_hull(wavelengths: np.ndarray,
 
 
 def continuum_remove(spec: np.ndarray, wavelengths: np.ndarray) -> np.ndarray:
-    """Apply convex-hull continuum removal to a 1-D spectrum."""
+    """Apply upper-convex-hull continuum removal to a single spectrum.
+
+    Computes ``CR(λ) = ρ(λ) / hull(λ)`` where ``hull`` is the upper convex
+    hull of the spectrum (Clark et al. 1987).  Values are clipped to [0, 1].
+    Removes broadband albedo variation, leaving only absorption-feature shape.
+
+    :param spec: reflectance values
+    :type spec: np.ndarray, shape (n_bands,)
+    :param wavelengths: band centre wavelengths (nm), strictly increasing
+    :type wavelengths: np.ndarray, shape (n_bands,)
+    :return: continuum-removed spectrum in [0, 1]
+    :rtype: np.ndarray, shape (n_bands,) float64
+    """
     continuum = _upper_hull(wavelengths, spec)
     with np.errstate(invalid='ignore', divide='ignore'):
         cr = np.where(continuum > 0, spec / continuum, 1.0)
@@ -955,9 +1191,18 @@ def continuum_remove(spec: np.ndarray, wavelengths: np.ndarray) -> np.ndarray:
 
 
 def continuum_remove_cube(cube: np.ndarray, wavelengths: np.ndarray) -> np.ndarray:
-    """Apply continuum removal to all pixels in a cube (n_bands, rows, cols).
+    """Apply continuum removal to every pixel in a hyperspectral cube.
 
-    Implemented as a vectorized batch loop for performance.
+    The per-pixel Graham-scan upper hull cannot be vectorized in NumPy, so this
+    function reshapes the cube to ``(n_pix, n_bands)`` and iterates over pixels.
+    This is inherently slower than fully vectorized methods.
+
+    :param cube: hyperspectral data
+    :type cube: np.ndarray, shape (n_bands, rows, cols)
+    :param wavelengths: band centre wavelengths (nm), strictly increasing
+    :type wavelengths: np.ndarray, shape (n_bands,)
+    :return: continuum-removed cube; each pixel spectrum in [0, 1]
+    :rtype: np.ndarray, shape (n_bands, rows, cols) same dtype as *cube*
     """
     n_bands, rows, cols = cube.shape
     n_pix = rows * cols
@@ -981,14 +1226,40 @@ EPS = 1e-12
 
 
 def _safe_cube(cube: np.ndarray) -> np.ndarray:
-    """Replace NaN/Inf in cube with 0."""
+    """Replace NaN and Inf values in a cube with 0.
+
+    Called at the entry of every ``match_*`` function to avoid propagating
+    non-finite values into similarity scores.
+
+    :param cube: input hyperspectral cube (not modified)
+    :type cube: np.ndarray
+    :return: cube with all non-finite values replaced by 0.0
+    :rtype: np.ndarray, same shape and dtype as *cube*
+    """
     return np.where(np.isfinite(cube), cube, 0.0)
 
 
 # ── 1. SAM — Spectral Angle Mapper ────────────────────────────────────────
 
 def match_sam(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """Spectral Angle Mapper: similarity = 1 – 2θ/π, θ ∈ [0, π/2]."""
+    """Spectral Angle Mapper (SAM) similarity.
+
+    Computes the angle θ between the reference vector and each pixel vector in
+    n-dimensional reflectance space (Kruse et al. 1993).  Scale-invariant:
+    insensitive to illumination magnitude changes.
+
+    Formula::
+
+        θ = arccos(r · p / (|r| · |p|))     θ ∈ [0, π/2]
+        similarity = 1 − 2θ/π               ∈ [0, 1]
+
+    :param cube: hyperspectral pixel data
+    :type cube: np.ndarray, shape (n_bands, rows, cols)
+    :param ref: reference spectrum resampled to sensor bands
+    :type ref: np.ndarray, shape (n_bands,)
+    :return: similarity map; 1 = identical direction, 0 = orthogonal
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     cube = _safe_cube(cube)
     dot = np.einsum('i,ijk->jk', ref, cube)
     norm_ref = np.linalg.norm(ref) + EPS
@@ -1001,7 +1272,24 @@ def match_sam(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
 # ── 2. SID — Spectral Information Divergence ──────────────────────────────
 
 def match_sid(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """SID = D(p‖q) + D(q‖p), similarity = exp(−SID)."""
+    """Spectral Information Divergence (SID) similarity.
+
+    Treats each spectrum as a discrete probability distribution and computes
+    the symmetric KL divergence (Chang 2000).  Sensitive to subtle
+    redistribution of spectral energy between bands.
+
+    Formula::
+
+        SID = D(r‖p) + D(p‖r) = Σ r_i ln(r_i/p_i) + p_i ln(p_i/r_i)
+        similarity = exp(−SID)   ∈ (0, 1]
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :return: similarity map
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     cube = _safe_cube(cube)
     p = ref / (ref.sum() + EPS) + EPS           # (n,)
     q = cube / (cube.sum(axis=0, keepdims=True) + EPS) + EPS  # (n, r, c)
@@ -1015,7 +1303,23 @@ def match_sid(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
 # ── 3. SID-SAM — Hybrid ───────────────────────────────────────────────────
 
 def match_sid_sam(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """SID × tan(SAM); similarity = exp(−SID·tan(θ))."""
+    """SID × tan(SAM) hybrid similarity (Chang 2000).
+
+    Combines the probabilistic (SID) and geometric (SAM) perspectives.
+    Particularly discriminative when both spectral shape and energy distribution
+    differ between target and background.
+
+    Formula::
+
+        similarity = exp(−SID · tan θ_SAM)
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :return: similarity map in [0, 1]
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     cube = _safe_cube(cube)
     # SAM angle
     dot = np.einsum('i,ijk->jk', ref, cube)
@@ -1035,7 +1339,23 @@ def match_sid_sam(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
 # ── 4. ED — Euclidean Distance ────────────────────────────────────────────
 
 def match_ed(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """L2 distance; similarity = 1/(1 + d/√n)."""
+    """Euclidean distance (L2) similarity.
+
+    Root-mean-square per-band difference, normalised by √n bands so the score
+    is independent of the number of bands.  Sensitive to overall magnitude
+    offset; use ``normalize=vector`` to remove illumination effects.
+
+    Formula::
+
+        similarity = 1 / (1 + ‖r − p‖₂ / √n)   ∈ (0, 1]
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :return: similarity map; 1 = identical, decreasing with distance
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     cube = _safe_cube(cube)
     diff = cube - ref[:, np.newaxis, np.newaxis]
     n = cube.shape[0]
@@ -1046,7 +1366,22 @@ def match_ed(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
 # ── 5. SAD — Spectral Absolute Difference ─────────────────────────────────
 
 def match_sad(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """L1 distance; similarity = 1/(1 + mean|r_i − p_i|)."""
+    """Spectral Absolute Difference (SAD / L1) similarity.
+
+    Mean absolute per-band difference.  More robust to individual outlier bands
+    than L2 because the error is not squared.
+
+    Formula::
+
+        similarity = 1 / (1 + mean|r_i − p_i|)   ∈ (0, 1]
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :return: similarity map
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     cube = _safe_cube(cube)
     dist = np.mean(np.abs(cube - ref[:, np.newaxis, np.newaxis]), axis=0)
     return 1.0 / (1.0 + dist)
@@ -1055,7 +1390,24 @@ def match_sad(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
 # ── 6. SCA — Spectral Correlation Angle (Pearson r) ──────────────────────
 
 def match_sca(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """Pearson r between reference and pixel spectrum; similarity = (r+1)/2."""
+    """Spectral Correlation Angle (SCA) — Pearson r similarity.
+
+    Computes the Pearson correlation coefficient between the reference and
+    each pixel spectrum.  Captures spectral shape independently of mean level;
+    equivalent to SAM applied to mean-centered spectra.
+
+    Formula::
+
+        SCA = Σ (r̄_i · p̄_i) / (‖r̄‖ · ‖p̄‖)   where ̄ = mean-centred
+        similarity = (SCA + 1) / 2             ∈ [0, 1]
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :return: similarity map; 1 = perfect positive correlation, 0 = anti-correlation
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     cube = _safe_cube(cube)
     mu_ref = ref.mean()
     mu_cube = cube.mean(axis=0)            # (r, c)
@@ -1073,7 +1425,26 @@ def match_sca(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
 
 def match_cr_sam(cube: np.ndarray, ref: np.ndarray,
                  wavelengths: np.ndarray) -> np.ndarray:
-    """SAM applied to continuum-removed spectra."""
+    """Continuum-Removed SAM (CR-SAM) similarity.
+
+    Applies upper-convex-hull continuum removal (Clark et al. 1987) to both
+    reference and pixel spectra, then computes SAM.  Isolates absorption-feature
+    shape by removing broadband albedo and slope contributions.  Best for
+    mineral identification where absorption position and depth matter.
+
+    .. note::
+        Uses a per-pixel Graham-scan loop.  Significantly slower than
+        fully vectorized methods for large images.
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :param wavelengths: band centre wavelengths (nm), shape (n_bands,)
+    :type wavelengths: np.ndarray
+    :return: similarity map in [0, 1]
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     ref_cr = continuum_remove(ref, wavelengths)
     cube_cr = continuum_remove_cube(cube, wavelengths)
     return match_sam(cube_cr, ref_cr)
@@ -1081,7 +1452,25 @@ def match_cr_sam(cube: np.ndarray, ref: np.ndarray,
 
 def match_cr_ed(cube: np.ndarray, ref: np.ndarray,
                 wavelengths: np.ndarray) -> np.ndarray:
-    """Euclidean distance applied to continuum-removed spectra."""
+    """Continuum-Removed Euclidean Distance (CR-ED) similarity.
+
+    Same upper-convex-hull continuum removal as :func:`match_cr_sam`, followed
+    by Euclidean distance.  Useful when absolute band-depth differences are
+    meaningful in addition to angular deviation.
+
+    .. note::
+        Uses a per-pixel Graham-scan loop.  Significantly slower than
+        fully vectorized methods for large images.
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :param wavelengths: band centre wavelengths (nm), shape (n_bands,)
+    :type wavelengths: np.ndarray
+    :return: similarity map in [0, 1]
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     ref_cr = continuum_remove(ref, wavelengths)
     cube_cr = continuum_remove_cube(cube, wavelengths)
     return match_ed(cube_cr, ref_cr)
@@ -1091,7 +1480,19 @@ def match_cr_ed(cube: np.ndarray, ref: np.ndarray,
 
 def _spectral_derivative(spec: np.ndarray, wavelengths: np.ndarray,
                          order: int = 1) -> np.ndarray:
-    """Compute finite-difference derivative normalized by wavelength spacing."""
+    """Compute finite-difference spectral derivative normalised by Δλ.
+
+    For *order* = 1: ``d[i] = (ρ[i+1] − ρ[i]) / (λ[i+1] − λ[i])``
+    For *order* = 2: applies the first derivative twice.
+
+    :param spec: reflectance values or cube (band axis must be axis 0)
+    :type spec: np.ndarray, shape (n_bands,) or (n_bands, rows, cols)
+    :param wavelengths: band centre wavelengths (nm), shape (n_bands,)
+    :type wavelengths: np.ndarray
+    :param int order: derivative order (1 or 2)
+    :return: derivative array; output has n_bands−order bands along axis 0
+    :rtype: np.ndarray
+    """
     dx = np.diff(wavelengths)
     dy = np.diff(spec, axis=0)
     d = dy / np.where(dx > 0, dx, 1.0)[:, np.newaxis, np.newaxis] \
@@ -1106,7 +1507,22 @@ def _spectral_derivative(spec: np.ndarray, wavelengths: np.ndarray,
 
 def match_gd1(cube: np.ndarray, ref: np.ndarray,
               wavelengths: np.ndarray) -> np.ndarray:
-    """SAM applied to first-derivative spectra."""
+    """First-derivative shape matching (GD1) similarity.
+
+    Computes the finite-difference first derivative of both spectra normalised
+    by Δλ, then applies SAM to the derivative vectors.  Analogous to high-pass
+    filtering before matching: insensitive to overall brightness and broadband
+    curvature; sensitive to slope transitions and absorption-edge positions.
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :param wavelengths: band centre wavelengths (nm), shape (n_bands,)
+    :type wavelengths: np.ndarray
+    :return: similarity map in [0, 1]
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     dx = np.diff(wavelengths)
     ref_d = np.diff(ref) / np.where(dx > 0, dx, 1.0)
     cube_d = np.diff(cube, axis=0) / np.where(dx > 0, dx, 1.0)[:, np.newaxis, np.newaxis]
@@ -1115,7 +1531,22 @@ def match_gd1(cube: np.ndarray, ref: np.ndarray,
 
 def match_gd2(cube: np.ndarray, ref: np.ndarray,
               wavelengths: np.ndarray) -> np.ndarray:
-    """SAM applied to second-derivative spectra."""
+    """Second-derivative shape matching (GD2) similarity.
+
+    Applies two successive finite-difference derivatives normalised by Δλ, then
+    applies SAM.  Responds only to local curvature — absorption-band centres and
+    inflection points.  Very effective for narrow-band identification; requires
+    well-calibrated data with low noise.
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :param wavelengths: band centre wavelengths (nm), shape (n_bands,)
+    :type wavelengths: np.ndarray
+    :return: similarity map in [0, 1]
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     dx = np.diff(wavelengths)
     ref_d1 = np.diff(ref) / np.where(dx > 0, dx, 1.0)
     cube_d1 = np.diff(cube, axis=0) / np.where(dx > 0, dx, 1.0)[:, np.newaxis, np.newaxis]
@@ -1129,9 +1560,24 @@ def match_gd2(cube: np.ndarray, ref: np.ndarray,
 
 def match_xcorr(cube: np.ndarray, ref: np.ndarray,
                 max_lag: int = 3) -> np.ndarray:
-    """Normalized cross-correlation at lags [−max_lag, +max_lag]; return max NCC.
+    """Normalized Cross-Correlation (XCORR) similarity.
 
-    NCC at lag k = Σ (r(i) − μ_r)(p(i+k) − μ_p) / (n·σ_r·σ_p)
+    Computes NCC at integer lags k ∈ [−max_lag, +max_lag] and returns the
+    maximum, tolerating small wavelength-calibration offsets between sensor and
+    reference library.
+
+    Formula::
+
+        NCC(k) = Σ_i (r̄_i · p̄_{i+k}) / (n · σ_r · σ_p)
+        similarity = (max_k NCC(k) + 1) / 2   ∈ [0, 1]
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :param int max_lag: maximum shift in bands (controlled by ``shift_window=``)
+    :return: similarity map
+    :rtype: np.ndarray, shape (rows, cols) float64
     """
     cube = _safe_cube(cube)
     n, rows, cols = cube.shape
@@ -1167,9 +1613,25 @@ def match_xcorr(cube: np.ndarray, ref: np.ndarray,
 
 def match_dtw(cube: np.ndarray, ref: np.ndarray,
               window: int = 3) -> np.ndarray:
-    """DTW distance with Sakoe-Chiba band; similarity = exp(−dtw_norm).
+    """Dynamic Time Warping (DTW) similarity (Sakoe & Chiba 1978).
 
-    Computed in batches to manage memory.
+    Computes the minimum-cost alignment between the reference and each pixel
+    spectrum under a Sakoe-Chiba band constraint of *window* bands.
+    Implemented as a rolling two-row DP to minimise memory usage; pixels are
+    processed in chunks of 512 to bound peak memory.
+
+    Formula::
+
+        DTW_norm = min_cost_alignment / max(n_bands, n_ref)
+        similarity = exp(−DTW_norm)   ∈ (0, 1]
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :param int window: Sakoe-Chiba band half-width in bands (``shift_window=``)
+    :return: similarity map
+    :rtype: np.ndarray, shape (rows, cols) float64
     """
     cube = _safe_cube(cube)
     n_bands, rows, cols = cube.shape
@@ -1214,9 +1676,29 @@ def match_dtw(cube: np.ndarray, ref: np.ndarray,
 # ── 13. SSIM — Spectral Structural Similarity Index ──────────────────────
 
 def match_ssim(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """Spectral SSIM (adapted from Wang et al. 2004 to 1-D spectra).
+    """Spectral Structural Similarity Index (SSIM) similarity.
 
-    SSIM = luminance × contrast × structure
+    Adaptation of Wang et al. (2004) image SSIM to 1-D spectra.  Decomposes
+    similarity into three components:
+
+    * **Luminance** ``L``: mean reflectance agreement
+    * **Contrast** ``C``: standard deviation agreement
+    * **Structure** ``S``: covariance / correlation of shapes
+
+    Formula::
+
+        L = (2μ_r μ_p + C₁) / (μ_r² + μ_p² + C₁)
+        C = (2σ_r σ_p + C₂) / (σ_r² + σ_p² + C₂)
+        S = (σ_rp + C₃)    / (σ_r σ_p + C₃)
+        SSIM = L · C · S   ∈ [−1, 1]
+        similarity = (SSIM + 1) / 2   ∈ [0, 1]
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :return: similarity map
+    :rtype: np.ndarray, shape (rows, cols) float64
     """
     cube = _safe_cube(cube)
     n = cube.shape[0]
@@ -1244,7 +1726,25 @@ def match_ssim(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
 # ── 14. JSD — Jensen-Shannon Divergence ───────────────────────────────────
 
 def match_jsd(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """JSD = (KLD(p‖m) + KLD(q‖m))/2 where m=(p+q)/2; similarity = exp(−JSD)."""
+    """Jensen-Shannon Divergence (JSD) similarity.
+
+    Symmetric, always well-defined version of KL divergence.  The mixture
+    distribution ``m = (r + p) / 2`` avoids log(0) even for exact zeros.
+
+    Formula::
+
+        JSD = (KLD(r‖m) + KLD(p‖m)) / 2   ∈ [0, ln 2]
+        similarity = exp(−JSD)             ∈ [exp(−ln 2), 1] ≈ [0.5, 1]
+
+    Recommended with the ``-z`` flag (probability simplex normalization).
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :return: similarity map
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     cube = _safe_cube(cube)
     p = (ref / (ref.sum() + EPS) + EPS)[:, np.newaxis, np.newaxis]  # (n,1,1)
     q = cube / (cube.sum(axis=0, keepdims=True) + EPS) + EPS
@@ -1258,7 +1758,25 @@ def match_jsd(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
 # ── 15. Bhattacharyya Coefficient ─────────────────────────────────────────
 
 def match_bhatt(cube: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """BC = Σ√(p_i · q_i) where p, q are probability distributions."""
+    """Bhattacharyya Coefficient (BC) similarity.
+
+    Measures the overlap between two non-negative spectra treated as
+    probability distributions.  Already a similarity in [0, 1]; no further
+    transformation is needed.  Robust to noise in individual bands.
+
+    Formula::
+
+        BC = Σ_i √(r_i · p_i)   ∈ [0, 1]
+
+    Recommended with the ``-z`` flag (probability simplex normalization).
+
+    :param cube: hyperspectral pixel data, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :return: similarity map; 1 = identical distributions, 0 = no overlap
+    :rtype: np.ndarray, shape (rows, cols) float64
+    """
     cube = _safe_cube(cube)
     p = np.maximum(ref / (ref.sum() + EPS), 0.0)
     q = np.maximum(
@@ -1865,7 +2383,22 @@ def compute_method(method: str, cube: np.ndarray, ref: np.ndarray,
                    wavelengths: np.ndarray,
                    shift_window: int,
                    score_maps: dict) -> np.ndarray:
-    """Run a single matching method and return the similarity map."""
+    """Dispatch to the appropriate ``match_*`` function and return a similarity map.
+
+    :param str method: method key (one of :data:`ALL_METHODS`, not ``'consensus'``)
+    :param cube: preprocessed hyperspectral cube, shape (n_bands, rows, cols)
+    :type cube: np.ndarray
+    :param ref: preprocessed reference spectrum, shape (n_bands,)
+    :type ref: np.ndarray
+    :param wavelengths: sensor band wavelengths (nm), shape (n_bands,)
+    :type wavelengths: np.ndarray
+    :param int shift_window: lag/warp window for xcorr and dtw
+    :param dict score_maps: already-computed maps (needed by ``'ensemble'``)
+    :return: similarity map in [0, 1], shape (rows, cols)
+    :rtype: np.ndarray float64
+    :raises SystemExit: via ``gs.fatal`` for ``'consensus'`` (must be handled by caller)
+                        or unknown method name
+    """
     if method == 'sam':
         return match_sam(cube, ref)
     elif method == 'sid':
@@ -1921,7 +2454,31 @@ def point_analysis(spec_pixel: np.ndarray, ref: np.ndarray,
                    shift_window: int,
                    flag_c: bool,
                    flag_z: bool) -> dict[str, float]:
-    """Compute all requested similarity scores for one pixel spectrum."""
+    """Compute all requested similarity scores for a single pixel spectrum.
+
+    Used by point mode (``-p`` flag).  Applies the same preprocessing as the
+    full-image path (continuum removal, probability simplex), then calls each
+    requested method on a ``(n_bands, 1, 1)`` mini-cube.
+
+    For ``'consensus'`` in *methods*, the function computes a weighted geometric
+    mean of the raw per-method scores (full CDF calibration is trivial for a
+    single pixel) and exposes the diversity weights as ``scores['_weights']``.
+
+    :param spec_pixel: pixel reflectance spectrum, shape (n_bands,)
+    :type spec_pixel: np.ndarray
+    :param ref: reference spectrum (already resampled to sensor bands)
+    :type ref: np.ndarray, shape (n_bands,)
+    :param wavelengths: sensor band wavelengths (nm)
+    :type wavelengths: np.ndarray, shape (n_bands,)
+    :param methods: list of method keys to evaluate
+    :type methods: list[str]
+    :param int shift_window: lag/warp window for xcorr and dtw
+    :param bool flag_c: apply continuum removal if ``True``
+    :param bool flag_z: apply probability-simplex normalization if ``True``
+    :return: dict mapping method key → similarity score in [0, 1];
+             ``'_weights'`` key is added when consensus is computed
+    :rtype: dict[str, float]
+    """
 
     def _1d_to_cube(s):
         return s[:, np.newaxis, np.newaxis]
@@ -1987,7 +2544,13 @@ def point_analysis(spec_pixel: np.ndarray, ref: np.ndarray,
 
 
 def set_similarity_colors(output_name: str) -> None:
-    """Apply a perceptually uniform blue–yellow–red color ramp for similarity."""
+    """Apply the standard i.hyper.sleuth blue–yellow–red colour ramp.
+
+    0 (no match) → deep blue → cyan → yellow → orange → 1 (perfect match) → red.
+    Applied via ``r.colors`` with explicit RGB control points.
+
+    :param str output_name: GRASS raster map name to colour
+    """
     rules = """\
 0.00 0:0:128
 0.10 0:0:255
@@ -2004,6 +2567,17 @@ def set_similarity_colors(output_name: str) -> None:
 
 def set_raster_metadata(output_name: str, raster3d: str,
                         method: str, ref_desc: str) -> None:
+    """Write title and description metadata to a similarity output map.
+
+    Uses ``r.support`` to store the method name, reference description, and
+    score interpretation (0 = no match, 1 = perfect match) in map history.
+
+    :param str output_name: GRASS raster map name to annotate
+    :param str raster3d: source 3D raster name (recorded in description)
+    :param str method: similarity method key used to produce the map
+    :param str ref_desc: short description of the reference spectrum
+                         (e.g. file basename or ``'inline (N points)'``)
+    """
     title = f"Spectral similarity ({METHOD_LABELS.get(method, method)})"
     description = (f"Similarity to reference spectrum [{ref_desc}] "
                    f"using {METHOD_LABELS.get(method, method)} "
@@ -2022,6 +2596,28 @@ def set_raster_metadata(output_name: str, raster3d: str,
 def print_info(bands: list[dict], ref_wls: np.ndarray, ref_vals: np.ndarray,
                resampled: np.ndarray, methods: list[str],
                lut: Optional['WavelengthLUT'] = None) -> None:
+    """Print the band-coverage and WavelengthLUT diagnostics report to the console.
+
+    Called when the ``-i`` (info) flag is set.  Outputs:
+
+    * Sensor coverage (number of bands, wavelength range)
+    * Reference spectrum range and resampled value range
+    * LUT coverage report including edge-fill and unobservable feature warnings
+    * List of requested methods with performance notes
+
+    :param bands: list of band dicts from :func:`get_band_info`
+    :type bands: list[dict]
+    :param ref_wls: original reference wavelengths (nm)
+    :type ref_wls: np.ndarray
+    :param ref_vals: original reference reflectance values
+    :type ref_vals: np.ndarray
+    :param resampled: reference spectrum resampled to sensor bands
+    :type resampled: np.ndarray
+    :param methods: list of method keys that would be computed
+    :type methods: list[str]
+    :param lut: optional pre-built LUT; if ``None`` the LUT section is skipped
+    :type lut: WavelengthLUT or None
+    """
     sep = "=" * 68
     wls = [b['wavelength'] for b in bands]
 
@@ -2062,6 +2658,24 @@ def print_info(bands: list[dict], ref_wls: np.ndarray, ref_vals: np.ndarray,
 
 
 def main(options: dict, flags: dict) -> int:
+    """Entry point called by the GRASS parser after ``gs.parser()`` returns.
+
+    Orchestrates the full processing pipeline:
+
+    1. Parse and validate the reference spectrum (inline or file).
+    2. Read band metadata from the 3D raster.
+    3. Build the :class:`WavelengthLUT` and check wavelength overlap.
+    4. Resample the reference to the sensor grid.
+    5. Apply preprocessing (normalization, continuum removal, simplex).
+    6. Point mode path: extract pixel spectrum, print scores, exit.
+    7. Full-image path: load cube, run requested methods, write outputs.
+
+    :param dict options: GRASS option dict from ``gs.parser()``
+    :param dict flags: GRASS flag dict from ``gs.parser()``
+    :return: 0 on success
+    :rtype: int
+    :raises SystemExit: via ``gs.fatal`` on any unrecoverable error
+    """
     raster3d    = options['input']
     output      = options['output']
     ref_inline  = options.get('reference') or ''
