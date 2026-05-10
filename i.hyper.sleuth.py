@@ -186,6 +186,20 @@
 
 from __future__ import annotations
 
+# ── ras3d standalone detection ────────────────────────────────────────────────
+import os as _os
+_RAS3D = False
+if not _os.environ.get('GISBASE'):
+    try:
+        import importlib.util as _ilu
+        if _ilu.find_spec('ras3d') and _ilu.find_spec('ras3d_grass_shim'):
+            from ras3d_grass_shim import install as _r3_install
+            _r3_install()
+            _RAS3D = True
+    except Exception:
+        pass
+# ─────────────────────────────────────────────────────────────────────────────
+
 import sys
 import os
 import re
@@ -351,6 +365,19 @@ def extract_band(raster3d: str, band_num: int) -> str:
     :rtype: str
     :raises SystemExit: via ``gs.fatal`` if ``Rast3d_extract_z_slice`` fails
     """
+    if _RAS3D:
+        import ras3d as _r3
+        import ras3d_write as _r3w
+        from ras3d_grass_shim import get_band_cache as _gbc
+        _h = _r3.open_cube(raster3d)
+        _arr = _r3.get_band(_h, band_num - 1)
+        _r3.close_cube(_h)
+        _base = raster3d.replace('@', '_').replace('#', '_').replace('.', '_')
+        tmp_name = _tmp(f"band_{_base}_{band_num}")
+        _r3w.write_raster2d(_r3w.outpath(tmp_name), _arr, None)
+        _gbc()[tmp_name] = _arr
+        return tmp_name
+
     lib = _load_g3d_lib()
     z = band_num - 1
     base = raster3d.replace('@', '_').replace('#', '_').replace('.', '_')
@@ -445,6 +472,28 @@ def get_band_info(raster3d: str, only_valid: bool = False,
     :rtype: list[dict]
     :raises SystemExit: via ``gs.fatal`` if no wavelength metadata is found
     """
+    if _RAS3D:
+        _sidecar = raster3d + '.wl.json'
+        if os.path.isfile(_sidecar):
+            with open(_sidecar) as _fj:
+                _wl_data = json.load(_fj)
+            _bands = []
+            for _entry in _wl_data:
+                _wl_nm = float(_entry['wavelength'])
+                _fwhm = float(_entry.get('fwhm', 10.0))
+                _valid = bool(_entry.get('valid', True))
+                if min_wl is not None and _wl_nm < min_wl:
+                    continue
+                if max_wl is not None and _wl_nm > max_wl:
+                    continue
+                if only_valid and not _valid:
+                    continue
+                _bands.append({'band': int(_entry['band']), 'wavelength': _wl_nm,
+                               'fwhm': _fwhm, 'valid': _valid, 'map_name': None})
+            _bands.sort(key=lambda b: b['wavelength'])
+            if _bands:
+                return _bands
+
     info = gs.raster3d_info(raster3d)
     depths = int(info['depths'])
 
@@ -935,6 +984,13 @@ def load_cube(bands: list[dict], raster3d: str,
     :return: hyperspectral cube, axes ``(n_bands, rows, cols)``
     :rtype: np.ndarray, dtype float32
     """
+    if _RAS3D:
+        import ras3d as _r3
+        _h = _r3.open_cube(raster3d)
+        _cube = _r3.read_all_bands(_h)  # [bands, rows, cols] float32
+        _r3.close_cube(_h)
+        return _cube
+
     import grass.script.array as garray
 
     n = len(bands)
@@ -1010,6 +1066,11 @@ def write_raster(data: np.ndarray, name: str, overwrite: bool = True) -> None:
     :param str name: output GRASS raster map name
     :param bool overwrite: overwrite an existing map with the same name
     """
+    if _RAS3D:
+        import ras3d_write as _r3w
+        _r3w.write_raster2d(_r3w.outpath(name), data.astype(np.float32), None)
+        return
+
     import grass.script.array as garray
     arr = garray.array()
     arr[:] = data.astype(np.float64)
