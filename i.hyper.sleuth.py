@@ -1053,8 +1053,7 @@ def load_cube(bands: list[dict], raster3d: str,
             map_name = extract_band(raster3d, b['band'])
             b['map_name'] = map_name
 
-        arr = garray.array()
-        arr.read(map_name)
+        arr = garray.array(mapname=map_name)
         band_data = np.asarray(arr, dtype=np.float32)
 
         if cube is None:
@@ -1065,6 +1064,62 @@ def load_cube(bands: list[dict], raster3d: str,
 
     gs.percent(n, n, 5)
     return cube
+
+
+def _spectrum_via_r3what(raster3d: str, east: float,
+                         north: float) -> list[float] | None:
+    """Read one pixel's whole depth column with a single r3.what call.
+
+    Returns one value per depth of the cube, indexed by depth, so the caller
+    reads band *n* as ``values[n - 1]``; ``None`` if r3.what is unavailable or
+    returns an unexpected number of values, so the caller can fall back to
+    per-band slicing.
+
+    r3.what reads only the voxels asked for, so a whole spectrum comes back in
+    well under a second. Extracting one 2D raster per band to query a single
+    pixel costs minutes on a large cube, because every band pays for the whole
+    scene.
+
+    r3.what reports one value per depth of the computational region, not of
+    the map, so the region's depth window is aligned to the cube's own stack
+    first. That happens inside a temporary region, which leaves the caller's
+    region untouched.
+    """
+    from grass.exceptions import CalledModuleError
+
+    try:
+        depths = int(gs.raster3d_info(raster3d)['depths'])
+    except (CalledModuleError, KeyError, ValueError):
+        return None
+    try:
+        gs.use_temp_region()
+    except (CalledModuleError, OSError):
+        return None
+    try:
+        gs.run_command('g.region', raster_3d=raster3d, quiet=True)
+        out = gs.read_command('r3.what', input=raster3d,
+                              coordinates=f"{east},{north}",
+                              null_value='nan', quiet=True)
+    except CalledModuleError:
+        return None
+    finally:
+        gs.del_temp_region()
+    line = next((ln for ln in out.splitlines() if ln.strip()), '')
+    # east|north|depth 1|depth 2|... in the cube's own depth order.
+    parts = line.split('|')[2:]
+    if len(parts) != depths:
+        gs.verbose(
+            f"r3.what returned {len(parts)} values for a {depths}-depth cube; "
+            "falling back to 2D slice extraction"
+        )
+        return None
+    values = []
+    for v in parts:
+        try:
+            values.append(float(v))
+        except ValueError:
+            values.append(float('nan'))
+    return values
 
 
 def read_pixel_spectrum(bands: list[dict], raster3d: str,
@@ -1082,6 +1137,12 @@ def read_pixel_spectrum(bands: list[dict], raster3d: str,
     :return: reflectance values, one per band; NaN where ``r.what`` returns NULL
     :rtype: np.ndarray, shape (n_bands,) float64
     """
+    column = _spectrum_via_r3what(raster3d, east, north)
+    if column is not None:
+        return np.array([column[b['band'] - 1] for b in bands],
+                        dtype=np.float64)
+
+    gs.verbose("Falling back to per-band 2D slice extraction…")
     coords = f"{east},{north}"
     spec = []
     for b in bands:
@@ -1334,17 +1395,25 @@ EPS = 1e-12
 
 
 def _safe_cube(cube: np.ndarray) -> np.ndarray:
-    """Replace NaN and Inf values in a cube with 0.
+    """Replace NaN and Inf values in a cube with 0, in place.
 
     Called at the entry of every ``match_*`` function to avoid propagating
-    non-finite values into similarity scores.
+    non-finite values into similarity scores. Mutates *cube* directly and
+    returns it unchanged in dtype: a naive ``np.where(mask, cube, 0.0)``
+    both allocates a full extra copy of the cube *and* silently upcasts
+    float32 cubes to float64 (Python float literal promotion), which for a
+    multi-GB hyperspectral cube can double or triple peak memory. Since the
+    cube is idempotently sanitized once, subsequent calls across methods
+    are cheap no-ops.
 
-    :param cube: input hyperspectral cube (not modified)
+    :param cube: input hyperspectral cube (mutated in place)
     :type cube: np.ndarray
-    :return: cube with all non-finite values replaced by 0.0
+    :return: the same array, with all non-finite values replaced by 0.0
     :rtype: np.ndarray, same shape and dtype as *cube*
     """
-    return np.where(np.isfinite(cube), cube, 0.0)
+    if not np.isfinite(cube).all():
+        np.nan_to_num(cube, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return cube
 
 
 # ── 1. SAM — Spectral Angle Mapper ────────────────────────────────────────
@@ -2976,7 +3045,12 @@ def main(options: dict, flags: dict) -> int:
         gs.message("Applying continuum removal to all pixels...")
         cube = continuum_remove_cube(cube, wls)
 
-    cube = cube.astype(np.float64)
+    # NOTE: cube is intentionally kept in its native dtype (float32) here.
+    # An unconditional `cube.astype(np.float64)` used to sit at this point,
+    # doubling peak memory for every run (e.g. 8.85 GB -> 17.7 GB for a
+    # 255-band EMIT scene) regardless of method precision needs — the
+    # match_* functions already promote to float64 per-operation via
+    # Python-float constants (EPS, etc.) where numerically necessary.
 
     # ------------------------------------------------------------------
     # Step 7a: Consensus path (runs all base methods, fuses internally)
