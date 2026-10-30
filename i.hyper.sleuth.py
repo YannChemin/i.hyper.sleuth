@@ -1400,11 +1400,12 @@ def _safe_cube(cube: np.ndarray) -> np.ndarray:
     Called at the entry of every ``match_*`` function to avoid propagating
     non-finite values into similarity scores. Mutates *cube* directly and
     returns it unchanged in dtype: a naive ``np.where(mask, cube, 0.0)``
-    both allocates a full extra copy of the cube *and* silently upcasts
-    float32 cubes to float64 (Python float literal promotion), which for a
-    multi-GB hyperspectral cube can double or triple peak memory. Since the
-    cube is idempotently sanitized once, subsequent calls across methods
-    are cheap no-ops.
+    allocates a full extra copy of the cube, doubling peak memory on a
+    multi-GB cube. Under NumPy 1.x it also upcast a float32 cube to float64
+    through value-based casting, tripling it; NEP 50 (NumPy 2) treats the
+    Python ``0.0`` as weak and keeps float32, so only the copy remains.
+    Since the cube is idempotently sanitized once, subsequent calls across
+    methods are cheap no-ops.
 
     :param cube: input hyperspectral cube (mutated in place)
     :type cube: np.ndarray
