@@ -427,8 +427,10 @@ def _parse_wl_from_r3info(raster3d: str) -> dict[int, tuple]:
 def _convert_wl_nm(wl: float, unit: str) -> float:
     """Convert a wavelength value to nanometres.
 
-    Accepted unit strings: ``nm`` / ``nanometer(s)``, ``um`` / ``µm`` /
-    ``micrometer(s)`` / ``micron(s)``, ``m`` / ``meter(s)``.
+    Accepted unit strings: ``nm`` / ``nanometer(s)`` / ``nanometre(s)``,
+    ``um`` / ``µm`` / ``micrometer(s)`` / ``micrometre(s)`` / ``micron(s)``,
+    ``m`` / ``meter(s)`` / ``metre(s)``.  ENVI headers write
+    ``Micrometers``, so the plural spellings matter.
     Any unrecognised unit emits a warning and is treated as nm.
 
     :param float wl: wavelength value in the given unit
@@ -437,11 +439,12 @@ def _convert_wl_nm(wl: float, unit: str) -> float:
     :rtype: float
     """
     u = unit.lower().strip()
-    if u in ('nm', 'nanometer', 'nanometers'):
+    if u in ('nm', 'nanometer', 'nanometers', 'nanometre', 'nanometres'):
         return wl
-    if u in ('um', 'µm', 'micrometer', 'micron', 'microns'):
+    if u in ('um', 'µm', 'micrometer', 'micrometers', 'micrometre',
+             'micrometres', 'micron', 'microns'):
         return wl * 1000.0
-    if u in ('m', 'meter', 'meters'):
+    if u in ('m', 'meter', 'meters', 'metre', 'metres'):
         return wl * 1e9
     gs.warning(f"Unknown wavelength unit '{unit}'; assuming nm")
     return wl
@@ -484,6 +487,47 @@ def _load_hyper_json_bands(raster3d: str) -> list[dict]:
             for i, wl in enumerate(wavelengths)]
 
 
+def _read_wl_sidecar(raster3d):
+    """Read the ras3d ``<cube>.wl.json`` sidecar, or return [].
+
+    The canonical writer is ``ras3d_write`` (and *i.hyper.atcorr* in
+    direct-file mode): the path is the cube path with its extension
+    stripped plus ``.wl.json``, and the payload is a flat JSON list of
+    band-centre wavelengths. A list of dicts carrying ``wavelength`` is
+    accepted too, so a richer sidecar written later still loads.
+
+    :param str raster3d: cube path or 3D raster name
+    :return: list of ``(wavelength_nm, fwhm_or_None, valid)`` tuples
+    :rtype: list[tuple]
+    """
+    import json as _json
+
+    for _sfx in ('.tif', '.tiff', '.h5', '.hdf5', '.vrt', '.img', ''):
+        _base = (raster3d.removesuffix(_sfx) if _sfx and raster3d.endswith(_sfx)
+                 else raster3d)
+        _wlp = _base + '.wl.json'
+        if not os.path.isfile(_wlp):
+            continue
+        with open(_wlp) as _fj:
+            _data = _json.load(_fj)
+        _out = []
+        for _entry in _data:
+            if isinstance(_entry, dict):
+                _wl = float(_entry['wavelength'])
+                _fwhm = (float(_entry['fwhm'])
+                         if _entry.get('fwhm') is not None else None)
+                _valid = bool(_entry.get('valid', True))
+            else:
+                _wl, _fwhm, _valid = float(_entry), None, True
+            # ras3d_write stores nm, but i.hyper.atcorr has written um.
+            if _wl < 10.0:
+                _wl *= 1000.0
+            _out.append((_wl, _fwhm, _valid))
+        if _out:
+            return _out
+    return []
+
+
 def get_band_info(raster3d: str, only_valid: bool = False,
                   min_wl: Optional[float] = None,
                   max_wl: Optional[float] = None) -> list[dict]:
@@ -510,26 +554,21 @@ def get_band_info(raster3d: str, only_valid: bool = False,
     :raises SystemExit: via ``gs.fatal`` if no wavelength metadata is found
     """
     if _RAS3D:
-        _sidecar = raster3d + '.wl.json'
-        if os.path.isfile(_sidecar):
-            with open(_sidecar) as _fj:
-                _wl_data = json.load(_fj)
-            _bands = []
-            for _entry in _wl_data:
-                _wl_nm = float(_entry['wavelength'])
-                _fwhm = float(_entry.get('fwhm', 10.0))
-                _valid = bool(_entry.get('valid', True))
-                if min_wl is not None and _wl_nm < min_wl:
-                    continue
-                if max_wl is not None and _wl_nm > max_wl:
-                    continue
-                if only_valid and not _valid:
-                    continue
-                _bands.append({'band': int(_entry['band']), 'wavelength': _wl_nm,
-                               'fwhm': _fwhm, 'valid': _valid, 'map_name': None})
-            _bands.sort(key=lambda b: b['wavelength'])
-            if _bands:
-                return _bands
+        _bands = []
+        for _i, (_wl_nm, _fwhm, _valid) in enumerate(
+                _read_wl_sidecar(raster3d), start=1):
+            if min_wl is not None and _wl_nm < min_wl:
+                continue
+            if max_wl is not None and _wl_nm > max_wl:
+                continue
+            if only_valid and not _valid:
+                continue
+            _bands.append({'band': _i, 'wavelength': _wl_nm,
+                           'fwhm': _fwhm if _fwhm is not None else 10.0,
+                           'valid': _valid, 'map_name': None})
+        _bands.sort(key=lambda b: b['wavelength'])
+        if _bands:
+            return _bands
 
     json_bands = _load_hyper_json_bands(raster3d)
     if json_bands:
@@ -2678,6 +2717,16 @@ def point_analysis(spec_pixel: np.ndarray, ref: np.ndarray,
 
     for mth in methods:
         if mth in ('ensemble', 'consensus'):
+            continue
+        if mth in GLOBAL_STATS_METHODS:
+            # MTF and CEM estimate the scene covariance from the
+            # pixels given to them. On a single pixel that
+            # covariance is undefined (n - 1 = 0), so the score
+            # would be an artefact of the regularisation term
+            # rather than a measurement. Skip them loudly instead.
+            gs.warning(
+                f"Method <{mth}> needs the image covariance and cannot "
+                "be computed for a single pixel; skipped.")
             continue
         cube_1 = _1d_to_cube(pix_proc)
         ref_use = ref_proc
