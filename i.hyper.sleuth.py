@@ -1074,6 +1074,18 @@ _R3WHAT_MAX_COORDS = 3500
 # read with sscanf("%d"), so it cannot exceed INT_MAX anyway.
 _R3WHAT_CACHE_LIMIT = 1 << 30
 
+# Pixels of the current window that have no finite band at all, as a boolean
+# (rows, cols) mask, or None before the cube is read.  These are the voxels
+# the 3D map stores as null, outside the flight swath or in a gap.  The
+# similarity functions cannot score them: _safe_cube() replaces every
+# non-finite value with 0, which turns such a pixel into the zero vector, and
+# a zero vector scores 0 under SAM and something arbitrary but finite under
+# the continuum-removed metrics.  Either way the output claims a measurement
+# where the instrument recorded none, so write_raster() restores a null on
+# them instead.  Set once in main(), immediately after load_cube() and before
+# any method runs, because preprocessing destroys the information.
+_NODATA = None
+
 
 def _load_cube_via_r3what(bands: list[dict], raster3d: str,
                           verbose: bool = False) -> np.ndarray:
@@ -1394,6 +1406,9 @@ def write_raster(data: np.ndarray, name: str, overwrite: bool = True) -> None:
     :param str name: output GRASS raster map name
     :param bool overwrite: overwrite an existing map with the same name
     """
+    if _NODATA is not None and _NODATA.any():
+        data = np.where(_NODATA, np.nan, data)
+
     if _RAS3D:
         import ras3d_write as _r3w
         _r3w.write_raster2d(_r3w.outpath(name), data.astype(np.float32), None)
@@ -1401,6 +1416,8 @@ def write_raster(data: np.ndarray, name: str, overwrite: bool = True) -> None:
 
     import grass.script.array as garray
     arr = garray.array()
+    # A NaN in a DCELL raster is GRASS's own null representation, so the NaNs
+    # placed above come back out of r.in.bin as null cells.
     arr[:] = data.astype(np.float64)
     arr.write(name, overwrite=overwrite)
 
@@ -3267,6 +3284,15 @@ def main(options: dict, flags: dict) -> int:
     gs.message("Loading hyperspectral cube into memory...")
     cube = load_cube(bands, raster3d, verbose=flag_v)
 
+    global _NODATA
+    _NODATA = ~np.isfinite(cube).any(axis=0)
+    n_nodata = int(_NODATA.sum())
+    if n_nodata:
+        gs.verbose("{n} of {t} cells ({p:.2f}%) are null in <{m}> at every "
+                   "band and will be null in the output".format(
+                       n=n_nodata, t=_NODATA.size,
+                       p=100.0 * n_nodata / _NODATA.size, m=raster3d))
+
     # Apply preprocessing to cube
     if flag_z:
         cube = to_prob_simplex_cube(cube)
@@ -3420,6 +3446,10 @@ def main(options: dict, flags: dict) -> int:
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
+    # Summarise what was written, so the reported range excludes the cells
+    # write_raster() turned into nulls.
+    if _NODATA is not None and _NODATA.any():
+        primary_map = np.where(_NODATA, np.nan, primary_map)
     s = primary_map[np.isfinite(primary_map)]
     sep = "=" * 60
     gs.message(" ")
