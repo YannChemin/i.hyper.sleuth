@@ -1055,18 +1055,151 @@ def resample_reference(ref_wls: np.ndarray, ref_vals: np.ndarray,
 # ---------------------------------------------------------------------------
 
 
+# Maximum coordinate pairs passed to one r3.what call.  Each pair costs about
+# 25 characters of command line, so 40000 of them stay far below the argument
+# size limit while keeping the per-call startup cost negligible.
+_R3WHAT_MAX_COORDS = 40000
+
+# Upper bound on the 3D tile cache granted to one r3.what call, in bytes.  The
+# cube itself has to fit in memory next to it, and RASTER3D_MAX_CACHE_SIZE is
+# read with sscanf("%d"), so it cannot exceed INT_MAX anyway.
+_R3WHAT_CACHE_LIMIT = 1 << 30
+
+
+def _load_cube_via_r3what(bands: list[dict], raster3d: str,
+                          verbose: bool = False) -> np.ndarray:
+    """Load the cube over the computational region with ``r3.what``.
+
+    The whole region is read in row chunks: every chunk is one ``r3.what``
+    call that returns one line per cell, with one field per depth of the
+    cube.  Nothing but the chunk is materialised, so the memory cost is the
+    output cube itself, and a 3D raster is read in its own storage order.
+
+    A 3D raster is stored as compressed 3D tiles (31 x 26 x 10 voxels on the
+    C2RD mosaic), so the cost of a read is the number of tiles it touches, not
+    the number of voxels asked for.  A chunk of whole rows asks for every
+    depth of a contiguous strip, which is exactly one pass over the tiles that
+    cover that strip; extracting one 2D band map per band instead touches
+    every tile of a whole tile layer and throws away nine depths out of ten.
+
+    :param bands: list of band dicts from :func:`get_band_info`
+    :type bands: list[dict]
+    :param str raster3d: name of the source 3D raster
+    :param bool verbose: if ``True``, log each chunk as it is read
+    :return: hyperspectral cube, axes ``(n_bands, rows, cols)``
+    :rtype: np.ndarray, dtype float32
+    :raises SystemExit: via ``gs.fatal`` if r3.what fails or returns an
+                        unexpected number of values
+    """
+    from grass.exceptions import CalledModuleError
+
+    reg = gs.region()
+    rows, cols = int(reg['rows']), int(reg['cols'])
+    north, west = float(reg['n']), float(reg['w'])
+    nsres, ewres = float(reg['nsres']), float(reg['ewres'])
+
+    try:
+        depths = int(gs.raster3d_info(raster3d)['depths'])
+    except (CalledModuleError, KeyError, ValueError) as exc:
+        gs.fatal(f"Cannot read the depth count of <{raster3d}>: {exc}")
+
+    band_idx = np.array([b['band'] - 1 for b in bands], dtype=np.intp)
+    if band_idx.size and int(band_idx.max()) >= depths:
+        gs.fatal(
+            "Band {band} was requested but <{map}> has only {depths} "
+            "depths.".format(band=int(band_idx.max()) + 1, map=raster3d,
+                             depths=depths)
+        )
+
+    eastings = west + (np.arange(cols) + 0.5) * ewres
+    cube = np.empty((len(bands), rows, cols), dtype=np.float32)
+
+    # A chunk is a whole number of tile rows, so that no tile is read twice,
+    # and the cache is sized for the tiles one chunk spans: the strip's tile
+    # columns times its tile rows times the cube's whole tile depth.
+    info = gs.raster3d_info(raster3d)
+    tdx = max(1, int(info.get('tiledimx', 1)))
+    tdy = max(1, int(info.get('tiledimy', 1)))
+    tdz = max(1, int(info.get('tiledimz', 1)))
+    tile_bytes = tdx * tdy * tdz * 8  # DCELL in the cache
+    chunk_rows = tdy * max(1, _R3WHAT_MAX_COORDS // (cols * tdy))
+    tiles = (-(-cols // tdx)) * (chunk_rows // tdy + 1) * (-(-depths // tdz))
+    cache_bytes = min(tiles * tile_bytes, _R3WHAT_CACHE_LIMIT)
+    env = os.environ.copy()
+    # Both variables are needed: the maximum silently overrides the tile count
+    # (lib/raster3d/header.c), and its own default is only 16 MB.
+    env['RASTER3D_MAX_CACHE_SIZE'] = str(cache_bytes)
+    env['RASTER3D_DEFAULT_CACHE_SIZE'] = str(max(1, cache_bytes // tile_bytes))
+    gs.verbose(
+        f"r3.what: {chunk_rows} rows per call, "
+        f"{cache_bytes // (1 << 20)} MB tile cache"
+    )
+
+    out_file = gs.tempfile(create=False)
+
+    gs.use_temp_region()
+    try:
+        # r3.what reports one value per depth of the computational region, so
+        # the depth window is taken from the cube itself and the caller's 2D
+        # window is then laid back over it.  Rows and columns are set
+        # explicitly so that the window comes back cell for cell.
+        gs.run_command('g.region', raster_3d=raster3d, quiet=True)
+        gs.run_command('g.region', n=reg['n'], s=reg['s'], w=reg['w'],
+                       e=reg['e'], rows=rows, cols=cols, quiet=True)
+
+        for r0 in range(0, rows, chunk_rows):
+            r1 = min(r0 + chunk_rows, rows)
+            if verbose:
+                gs.verbose(f"  Reading rows {r0}-{r1 - 1} of {rows} ...")
+            coords = []
+            for row in range(r0, r1):
+                northing = north - (row + 0.5) * nsres
+                for easting in eastings:
+                    coords.append(f"{easting:.6f}")
+                    coords.append(f"{northing:.6f}")
+            try:
+                gs.run_command('r3.what', input=raster3d, coordinates=coords,
+                               output=out_file, null_value='nan',
+                               overwrite=True, quiet=True, env=env)
+            except CalledModuleError as exc:
+                gs.fatal(f"r3.what failed on rows {r0}-{r1 - 1}: {exc}")
+
+            block = np.loadtxt(out_file, delimiter='|', dtype=np.float32,
+                               ndmin=2)
+            expected = ((r1 - r0) * cols, depths + 2)
+            if block.shape != expected:
+                gs.fatal(
+                    "r3.what returned {got} instead of {want} for rows "
+                    "{r0}-{r1}.".format(got=block.shape, want=expected,
+                                        r0=r0, r1=r1 - 1)
+                )
+            cube[:, r0:r1, :] = (block[:, 2 + band_idx].T
+                                 .reshape(len(bands), r1 - r0, cols))
+            gs.percent(r1, rows, 2)
+    finally:
+        gs.del_temp_region()
+        try:
+            os.remove(out_file)
+        except OSError:
+            pass
+
+    gs.percent(rows, rows, 2)
+    return cube
+
+
 def load_cube(bands: list[dict], raster3d: str,
               verbose: bool = False) -> np.ndarray:
     """Load all bands into a ``(n_bands, rows, cols)`` float32 NumPy array.
 
-    Reads each band via ``grass.script.array.array`` (garray).  If
-    ``band['map_name']`` is ``None`` (no pre-existing 2D slice), the slice is
-    extracted on-the-fly with :func:`extract_band` and the dict is updated.
+    Reads the cube with ``r3.what``, which honours the computational region
+    and reads only the voxels of that region.  Pre-extracted band maps in
+    ``band['map_name']`` are ignored: a cube read in one storage order is both
+    cheaper and safer than one assembled from band maps.
 
     :param bands: list of band dicts from :func:`get_band_info`
     :type bands: list[dict]
-    :param str raster3d: name of the source 3D raster (used when extracting slices)
-    :param bool verbose: if ``True``, log each band as it is loaded
+    :param str raster3d: name of the source 3D raster
+    :param bool verbose: if ``True``, log progress as the cube is read
     :return: hyperspectral cube, axes ``(n_bands, rows, cols)``
     :rtype: np.ndarray, dtype float32
     """
@@ -1077,32 +1210,7 @@ def load_cube(bands: list[dict], raster3d: str,
         _r3.close_cube(_h)
         return _cube
 
-    import grass.script.array as garray
-
-    n = len(bands)
-    cube = None
-
-    for idx, b in enumerate(bands):
-        if verbose:
-            gs.verbose(f"  Loading band {b['band']} ({b['wavelength']:.1f} nm) ...")
-        gs.percent(idx, n, 5)
-
-        map_name = b.get('map_name')
-        if map_name is None:
-            map_name = extract_band(raster3d, b['band'])
-            b['map_name'] = map_name
-
-        arr = garray.array(mapname=map_name)
-        band_data = np.asarray(arr, dtype=np.float32)
-
-        if cube is None:
-            rows, cols = band_data.shape
-            cube = np.empty((n, rows, cols), dtype=np.float32)
-
-        cube[idx] = band_data
-
-    gs.percent(n, n, 5)
-    return cube
+    return _load_cube_via_r3what(bands, raster3d, verbose=verbose)
 
 
 def _spectrum_via_r3what(raster3d: str, east: float,
