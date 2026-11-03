@@ -1055,10 +1055,11 @@ def resample_reference(ref_wls: np.ndarray, ref_vals: np.ndarray,
 # ---------------------------------------------------------------------------
 
 
-# Maximum coordinate pairs passed to one r3.what call.  Each pair costs about
-# 25 characters of command line, so 40000 of them stay far below the argument
-# size limit while keeping the per-call startup cost negligible.
-_R3WHAT_MAX_COORDS = 40000
+# Maximum coordinate pairs passed to one r3.what call.  The limit is not
+# ARG_MAX but MAX_ARG_STRLEN, 128 KiB for a single argument, and the whole
+# coordinate list is one argument: at about 27 bytes per pair, 3500 pairs stay
+# comfortably under it while keeping the per-call startup cost small.
+_R3WHAT_MAX_COORDS = 3500
 
 # Upper bound on the 3D tile cache granted to one r3.what call, in bytes.  The
 # cube itself has to fit in memory next to it, and RASTER3D_MAX_CACHE_SIZE is
@@ -1114,16 +1115,26 @@ def _load_cube_via_r3what(bands: list[dict], raster3d: str,
     eastings = west + (np.arange(cols) + 0.5) * ewres
     cube = np.empty((len(bands), rows, cols), dtype=np.float32)
 
-    # A chunk is a whole number of tile rows, so that no tile is read twice,
-    # and the cache is sized for the tiles one chunk spans: the strip's tile
-    # columns times its tile rows times the cube's whole tile depth.
+    # A chunk follows the cube's own tile grid, so that a tile is read once
+    # and used whole, and the cache is sized for the tiles one chunk spans:
+    # its tile columns times its tile rows times the cube's whole tile depth.
     info = gs.raster3d_info(raster3d)
     tdx = max(1, int(info.get('tiledimx', 1)))
     tdy = max(1, int(info.get('tiledimy', 1)))
     tdz = max(1, int(info.get('tiledimz', 1)))
     tile_bytes = tdx * tdy * tdz * 8  # DCELL in the cache
-    chunk_rows = tdy * max(1, _R3WHAT_MAX_COORDS // (cols * tdy))
-    tiles = (-(-cols // tdx)) * (chunk_rows // tdy + 1) * (-(-depths // tdz))
+    if cols * tdy <= _R3WHAT_MAX_COORDS:
+        chunk_cols = cols
+        chunk_rows = tdy * max(1, _R3WHAT_MAX_COORDS // (cols * tdy))
+    else:
+        # Whole rows do not fit in one call, so the chunk is a block of
+        # columns as well: a block that follows the tile grid in both axes
+        # costs far fewer tile reads than the same number of cells taken as
+        # fragments of whole rows.
+        chunk_rows = tdy
+        chunk_cols = tdx * max(1, _R3WHAT_MAX_COORDS // (tdy * tdx))
+    tiles = ((-(-chunk_cols // tdx)) + 1) * (chunk_rows // tdy + 1) * \
+        (-(-depths // tdz))
     cache_bytes = min(tiles * tile_bytes, _R3WHAT_CACHE_LIMIT)
     env = os.environ.copy()
     # Both variables are needed: the maximum silently overrides the tile count
@@ -1131,7 +1142,7 @@ def _load_cube_via_r3what(bands: list[dict], raster3d: str,
     env['RASTER3D_MAX_CACHE_SIZE'] = str(cache_bytes)
     env['RASTER3D_DEFAULT_CACHE_SIZE'] = str(max(1, cache_bytes // tile_bytes))
     gs.verbose(
-        f"r3.what: {chunk_rows} rows per call, "
+        f"r3.what: {chunk_rows} x {chunk_cols} cells per call, "
         f"{cache_bytes // (1 << 20)} MB tile cache"
     )
 
@@ -1147,35 +1158,42 @@ def _load_cube_via_r3what(bands: list[dict], raster3d: str,
         gs.run_command('g.region', n=reg['n'], s=reg['s'], w=reg['w'],
                        e=reg['e'], rows=rows, cols=cols, quiet=True)
 
+        done = 0
         for r0 in range(0, rows, chunk_rows):
             r1 = min(r0 + chunk_rows, rows)
-            if verbose:
-                gs.verbose(f"  Reading rows {r0}-{r1 - 1} of {rows} ...")
-            coords = []
-            for row in range(r0, r1):
-                northing = north - (row + 0.5) * nsres
-                for easting in eastings:
-                    coords.append(f"{easting:.6f}")
-                    coords.append(f"{northing:.6f}")
-            try:
-                gs.run_command('r3.what', input=raster3d, coordinates=coords,
-                               output=out_file, null_value='nan',
-                               overwrite=True, quiet=True, env=env)
-            except CalledModuleError as exc:
-                gs.fatal(f"r3.what failed on rows {r0}-{r1 - 1}: {exc}")
+            for c0 in range(0, cols, chunk_cols):
+                c1 = min(c0 + chunk_cols, cols)
+                where = f"rows {r0}-{r1 - 1}, columns {c0}-{c1 - 1}"
+                if verbose:
+                    gs.verbose(f"  Reading {where} of {rows} x {cols} ...")
+                coords = []
+                for row in range(r0, r1):
+                    northing = north - (row + 0.5) * nsres
+                    for easting in eastings[c0:c1]:
+                        coords.append(f"{easting:.6f}")
+                        coords.append(f"{northing:.6f}")
+                try:
+                    gs.run_command('r3.what', input=raster3d,
+                                   coordinates=coords, output=out_file,
+                                   null_value='nan', overwrite=True,
+                                   quiet=True, env=env)
+                except CalledModuleError as exc:
+                    gs.fatal(f"r3.what failed on {where}: {exc}")
 
-            block = np.loadtxt(out_file, delimiter='|', dtype=np.float32,
-                               ndmin=2)
-            expected = ((r1 - r0) * cols, depths + 2)
-            if block.shape != expected:
-                gs.fatal(
-                    "r3.what returned {got} instead of {want} for rows "
-                    "{r0}-{r1}.".format(got=block.shape, want=expected,
-                                        r0=r0, r1=r1 - 1)
-                )
-            cube[:, r0:r1, :] = (block[:, 2 + band_idx].T
-                                 .reshape(len(bands), r1 - r0, cols))
-            gs.percent(r1, rows, 2)
+                block = np.loadtxt(out_file, delimiter='|', dtype=np.float32,
+                                   ndmin=2)
+                expected = ((r1 - r0) * (c1 - c0), depths + 2)
+                if block.shape != expected:
+                    gs.fatal(
+                        "r3.what returned {got} instead of {want} for "
+                        "{where}.".format(got=block.shape, want=expected,
+                                          where=where)
+                    )
+                cube[:, r0:r1, c0:c1] = (block[:, 2 + band_idx].T
+                                         .reshape(len(bands), r1 - r0,
+                                                  c1 - c0))
+                done += (r1 - r0) * (c1 - c0)
+                gs.percent(done, rows * cols, 2)
     finally:
         gs.del_temp_region()
         try:
@@ -1183,7 +1201,7 @@ def _load_cube_via_r3what(bands: list[dict], raster3d: str,
         except OSError:
             pass
 
-    gs.percent(rows, rows, 2)
+    gs.percent(rows * cols, rows * cols, 2)
     return cube
 
 

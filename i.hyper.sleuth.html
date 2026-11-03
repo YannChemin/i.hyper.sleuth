@@ -446,6 +446,20 @@ m to nm when reading band metadata.</p>
 <p>Spectra must be in surface reflectance units (0–1 range).
 Top-of-atmosphere radiance or raw DN values will produce invalid results.</p>
 
+<h3>Computational region</h3>
+<p>The module works on the current computational region, not on the whole
+cube: set the region first and only that window is read and written.  Memory
+is rows&nbsp;x&nbsp;cols&nbsp;x&nbsp;bands&nbsp;x&nbsp;4 bytes, so a 0.03&nbsp;m
+window of 900&nbsp;x&nbsp;930 cells over 408 bands needs about 1.4&nbsp;GB, and
+a large scene has to be processed in tiles and patched afterwards with
+<em>r.patch</em>.</p>
+
+<p>The cube is read with <em>r3.what</em>, one call per strip of rows, which
+reads only the voxels of the region.  A 3D raster is stored as compressed 3D
+tiles, so a strip asking for every band of a contiguous block of rows is one
+pass over the tiles that cover it; reading band by band instead touches every
+tile of a whole tile layer and discards all but one of its depths.</p>
+
 <h3>Output map types</h3>
 <p>All output maps are floating-point FCELL rasters in [0,&nbsp;1].  All maps
 share a blue → yellow → red colour ramp applied automatically via
@@ -471,6 +485,11 @@ alignment warp.  For large images use a small <tt>shift_window</tt>
 computation (Graham scan) and are approximately 10× slower than purely
 linear methods.  For a 1000 × 1000 image with 200 bands, expect several
 minutes.</p>
+
+<p>Reading the cube usually dominates: <em>r3.what</em> returns about 350,000
+voxels per second on this hardware, so a 623&nbsp;×&nbsp;897 window over 408
+bands (228&nbsp;M voxels) takes about ten minutes, against seconds to minutes
+for the methods themselves.</p>
 
 <p>Method <b>consensus</b> runs all 17 base methods internally.  On the first
 run this is slow; subsequent runs can reuse cached maps when
@@ -608,7 +627,8 @@ i.hyper.sleuth input=scene_atcorr output=min_match \
 <a href="r.mapcalc.html">r.mapcalc</a>,
 <a href="r.colors.html">r.colors</a>,
 <a href="r.univar.html">r.univar</a>,
-<a href="r3.info.html">r3.info</a>
+<a href="r3.info.html">r3.info</a>,
+<a href="r3.what.html">r3.what</a>
 </em>
 
 <h2>AUTHORS</h2>

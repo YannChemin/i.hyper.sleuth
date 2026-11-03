@@ -502,6 +502,20 @@ band metadata.
 Spectra must be in surface reflectance units (0–1 range).  Top-of-atmosphere
 radiance or raw DN values will produce invalid results.
 
+### Computational region
+
+The module works on the current computational region, not on the whole cube:
+set the region first and only that window is read and written.  Memory is
+rows x cols x bands x 4 bytes, so a 0.03 m window of 900 x 930 cells over 408
+bands needs about 1.4 GB, and a large scene has to be processed in tiles and
+patched afterwards with *r.patch*.
+
+The cube is read with *r3.what*, one call per strip of rows, which reads only
+the voxels of the region.  A 3D raster is stored as compressed 3D tiles, so a
+strip asking for every band of a contiguous block of rows is one pass over the
+tiles that cover it; reading band by band instead touches every tile of a
+whole tile layer and discards all but one of its depths.
+
 ### Output map types
 
 All output maps are **floating-point FCELL** rasters in [0, 1].  The primary
@@ -522,6 +536,11 @@ a blue → yellow → red colour ramp applied automatically via **r.colors**
 For a 1000 × 1000 image with 200 bands, fast methods complete in seconds;
 `cr_sam`/`cr_ed` may take several minutes; `dtw` with default
 `shift_window=3` is intermediate.
+
+Reading the cube usually dominates: *r3.what* returns about 350,000 voxels
+per second on this hardware, so a 623 x 897 window over 408 bands (228 M
+voxels) takes about ten minutes, against seconds to minutes for the methods
+themselves.
 
 ### Band tolerance
 
@@ -669,7 +688,8 @@ Recommended for `sid`, `jsd`, and `bhatt`.
 [r.mapcalc](https://grass.osgeo.org/grass-stable/manuals/r.mapcalc.html),
 [r.colors](https://grass.osgeo.org/grass-stable/manuals/r.colors.html),
 [r.univar](https://grass.osgeo.org/grass-stable/manuals/r.univar.html),
-[r3.info](https://grass.osgeo.org/grass-stable/manuals/r3.info.html)
+[r3.info](https://grass.osgeo.org/grass-stable/manuals/r3.info.html),
+[r3.what](https://grass.osgeo.org/grass-stable/manuals/r3.what.html)
 
 ## REFERENCES
 
