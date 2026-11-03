@@ -486,10 +486,16 @@ computation (Graham scan) and are approximately 10× slower than purely
 linear methods.  For a 1000 × 1000 image with 200 bands, expect several
 minutes.</p>
 
-<p>Reading the cube usually dominates: <em>r3.what</em> returns about 350,000
-voxels per second on this hardware, so a 623&nbsp;×&nbsp;897 window over 408
-bands (228&nbsp;M voxels) takes about ten minutes, against seconds to minutes
-for the methods themselves.</p>
+<p>Reading the cube dominates.  Measured on one 623&nbsp;×&nbsp;897 window over
+408 bands (228&nbsp;M voxels) of a 0.03&nbsp;m drone mosaic, with the runs
+interleaved so that a page-cache advantage would show up within a route rather
+than between them: <em>r3.what</em> in blocks on the tile grid took 133&nbsp;s
+and 135&nbsp;s at 0.94&nbsp;GB peak RSS, one 2D band map per band took
+193&nbsp;s and 189&nbsp;s at 1.94&nbsp;GB.  Both return the same values.
+<em>r3.what</em> is the default: 1.4×&nbsp;faster, one copy of the cube, and a
+null voxel comes back as NaN rather than through a temporary raster.  One
+623&nbsp;×&nbsp;897 tile with <tt>method=sam,cr_sam</tt> takes 3&nbsp;min
+39&nbsp;s in all, so the methods themselves are a minor part of the cost.</p>
 
 <p>Method <b>consensus</b> runs all 17 base methods internally.  On the first
 run this is slow; subsequent runs can reuse cached maps when

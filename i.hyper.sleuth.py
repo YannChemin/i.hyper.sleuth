@@ -1055,6 +1055,14 @@ def resample_reference(ref_wls: np.ndarray, ref_vals: np.ndarray,
 # ---------------------------------------------------------------------------
 
 
+# Which route load_cube() takes.  Measured on one 623 x 897 x 408 window of
+# the C2RD mosaic (228 M voxels), runs interleaved r3what/slices/slices/r3what
+# so that a page-cache advantage would show up within a route: r3.what
+# 133.1 s and 135.3 s at 0.94 GB peak RSS, band slices 193.0 s and 188.6 s at
+# 1.94 GB.  Both return the same values; r3.what is 1.4x faster and keeps the
+# cube at one copy, so it is the default.
+_CUBE_LOADER = 'r3what'
+
 # Maximum coordinate pairs passed to one r3.what call.  The limit is not
 # ARG_MAX but MAX_ARG_STRLEN, 128 KiB for a single argument, and the whole
 # coordinate list is one argument: at about 27 bytes per pair, 3500 pairs stay
@@ -1205,14 +1213,59 @@ def _load_cube_via_r3what(bands: list[dict], raster3d: str,
     return cube
 
 
+def _load_cube_via_slices(bands: list[dict], raster3d: str,
+                          verbose: bool = False) -> np.ndarray:
+    """Load the cube by extracting one 2D band map per band.
+
+    Each band is extracted with :func:`extract_band`
+    (``Rast3d_extract_z_slice``, a tile-bulk read of one Z level) and read
+    back through garray.  Correct only with a computational region on the
+    cube's own cell grid, which that function now enforces.
+
+    :param bands: list of band dicts from :func:`get_band_info`
+    :type bands: list[dict]
+    :param str raster3d: name of the source 3D raster
+    :param bool verbose: if ``True``, log each band as it is loaded
+    :return: hyperspectral cube, axes ``(n_bands, rows, cols)``
+    :rtype: np.ndarray, dtype float32
+    """
+    import grass.script.array as garray
+
+    n = len(bands)
+    cube = None
+
+    for idx, b in enumerate(bands):
+        if verbose:
+            gs.verbose(f"  Loading band {b['band']} "
+                       f"({b['wavelength']:.1f} nm) ...")
+        gs.percent(idx, n, 5)
+
+        map_name = b.get('map_name')
+        if map_name is None:
+            map_name = extract_band(raster3d, b['band'])
+            b['map_name'] = map_name
+
+        # Without null=, garray reads a GRASS null as 0, which is a
+        # reflectance value and silently fakes a dark pixel.
+        arr = garray.array(mapname=map_name, null=np.nan)
+        band_data = np.asarray(arr, dtype=np.float32)
+
+        if cube is None:
+            rows, cols = band_data.shape
+            cube = np.empty((n, rows, cols), dtype=np.float32)
+
+        cube[idx] = band_data
+
+    gs.percent(n, n, 5)
+    return cube
+
+
 def load_cube(bands: list[dict], raster3d: str,
               verbose: bool = False) -> np.ndarray:
     """Load all bands into a ``(n_bands, rows, cols)`` float32 NumPy array.
 
-    Reads the cube with ``r3.what``, which honours the computational region
-    and reads only the voxels of that region.  Pre-extracted band maps in
-    ``band['map_name']`` are ignored: a cube read in one storage order is both
-    cheaper and safer than one assembled from band maps.
+    Both routes honour the computational region and read only its voxels;
+    ``_CUBE_LOADER`` picks the one that is faster here.
 
     :param bands: list of band dicts from :func:`get_band_info`
     :type bands: list[dict]
@@ -1228,6 +1281,8 @@ def load_cube(bands: list[dict], raster3d: str,
         _r3.close_cube(_h)
         return _cube
 
+    if _CUBE_LOADER == 'slices':
+        return _load_cube_via_slices(bands, raster3d, verbose=verbose)
     return _load_cube_via_r3what(bands, raster3d, verbose=verbose)
 
 

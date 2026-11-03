@@ -537,10 +537,20 @@ For a 1000 × 1000 image with 200 bands, fast methods complete in seconds;
 `cr_sam`/`cr_ed` may take several minutes; `dtw` with default
 `shift_window=3` is intermediate.
 
-Reading the cube usually dominates: *r3.what* returns about 350,000 voxels
-per second on this hardware, so a 623 x 897 window over 408 bands (228 M
-voxels) takes about ten minutes, against seconds to minutes for the methods
-themselves.
+Reading the cube dominates. Measured on one 623 x 897 window over 408 bands
+(228 M voxels) of a 0.03 m drone mosaic, with the runs interleaved so that a
+page-cache advantage would show up within a route rather than between them:
+
+| Cube read | Time | Peak RSS |
+|---|---|---|
+| *r3.what*, blocks on the tile grid | 133 s, 135 s | 0.94 GB |
+| one 2D band map per band | 193 s, 189 s | 1.94 GB |
+
+Both return the same values. *r3.what* is the default: it is 1.4x faster,
+holds one copy of the cube, and reports a null voxel as NaN instead of
+writing it into a temporary raster first. One 623 x 897 tile with
+`method=sam,cr_sam` takes 3 min 39 s in all, so the methods themselves are a
+minor part of the cost.
 
 ### Band tolerance
 
